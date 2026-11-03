@@ -10,14 +10,16 @@ VCC             Red                 5V / VBUS           Power from 5V (USB or ex
 Signal (PWM)    Orange / Yellow     GPIO 4 (GP4)        50Hz LEDC hardware PWM signal
 
 
-2. HT517 I2S AMPLIFIER WIRING:
+2. HT517 I2S AMPLIFIER WIRING (V1.0.2 SILKSCREEN):
 --------------------------------------------------------------------------------
 HT517 Pin       Function            YD-ESP32-S3 Pin     Notes
-BCLK / SCK      Bit Clock           GPIO 10             I2S Channel 0 Clock
-LRC / WS        Word Select / L-R   GPIO 11             I2S Left / Right Frame Sync
-DIN / SD        Serial Data In      GPIO 12             I2S Audio Data Stream
-VCC             Power Supply        5V / 3.3V           5V recommended for full volume
+Vin             Power Supply        5V / 3.3V           5V recommended for full 3.1W volume
 GND             Ground              GND                 Common Ground
+EN              Enable / Mute       NC (Unconnected)    Internal pull-up; leave floating
+GAIN            Gain Select         NC (Unconnected)    Floating for default gain
+DI2             Serial Data (DIN)   GPIO 12             I2S Audio Data Stream
+DIO (DI0)       Bit Clock (BCLK)    GPIO 10             I2S Channel 0 Clock
+DI1             Word Select (LRC)   GPIO 11             I2S Left / Right Frame Sync
 
 
 3. OPTIONAL PDM MICROPHONE WIRING:
