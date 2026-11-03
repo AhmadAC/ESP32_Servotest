@@ -16,9 +16,9 @@
 static const char *TAG = "AUDIO";
 
 // HT517 I2S Amplifier Pinout Mapping:
-// GPIO 10 -> HT517 pin D10 (BCLK / SCK)
-// GPIO 11 -> HT517 pin D11 (LRC / WS)
-// GPIO 12 -> HT517 pin D12 (DIN / SD)
+// GPIO 10 -> HT517 pin DIO / DI0 (BCLK / SCK)
+// GPIO 11 -> HT517 pin DI1 (LRC / WS)
+// GPIO 12 -> HT517 pin DI2 (DIN / SD)
 #define I2S_BCLK_PIN GPIO_NUM_10
 #define I2S_LRC_PIN  GPIO_NUM_11
 #define I2S_DIN_PIN  GPIO_NUM_12
@@ -437,7 +437,7 @@ static void audio_task(void *pvParameter) {
                         }
                     }
 
-                    // Allow the trailing audio data to physically exit the DMA FIFO
+                    // Allow trailing audio data to exit the DMA FIFO
                     vTaskDelay(pdMS_TO_TICKS(100));
 
                     if (audio_stop_requested) {
@@ -467,9 +467,9 @@ void audio_player_init(void) {
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
-            .bclk = I2S_BCLK_PIN, // GPIO 10 -> HT517 D10
-            .ws   = I2S_LRC_PIN,  // GPIO 11 -> HT517 D11
-            .dout = I2S_DIN_PIN,  // GPIO 12 -> HT517 D12
+            .bclk = I2S_BCLK_PIN, // GPIO 10 -> HT517 DIO
+            .ws   = I2S_LRC_PIN,  // GPIO 11 -> HT517 DI1
+            .dout = I2S_DIN_PIN,  // GPIO 12 -> HT517 DI2
             .din  = I2S_GPIO_UNUSED,
             .invert_flags = {
                 .mclk_inv = false, .bclk_inv = false, .ws_inv = false
@@ -502,6 +502,9 @@ void audio_player_init(void) {
         pdm_rx_cfg.slot_cfg.slot_mask = I2S_PDM_SLOT_LEFT;
         if (i2s_channel_init_pdm_rx_mode(rx_chan, &pdm_rx_cfg) == ESP_OK) {
             i2s_channel_enable(rx_chan);
+        } else {
+            i2s_del_channel(rx_chan);
+            rx_chan = NULL;
         }
     }
 
@@ -509,7 +512,7 @@ void audio_player_init(void) {
     xTaskCreatePinnedToCore(audio_stream_task, "audio_stream_task", 4096, NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(audio_rx_stream_task, "audio_rx_stream_task", 4096, NULL, 3, NULL, 1);
 
-    ESP_LOGI(TAG, "HT517 I2S Audio Initialized (BCLK=GPIO10, LRC=GPIO11, DIN=GPIO12)");
+    ESP_LOGI(TAG, "HT517 I2S Audio Initialized (DIO=GPIO10, DI1=GPIO11, DI2=GPIO12)");
 }
 
 void audio_set_volume(int volume_pct) {

@@ -84,7 +84,7 @@ static void servo_set_angle(int angle) {
 }
 
 // =========================================================================
-// SERIAL REPL CONSOLE TASK (INTERACTIVE REPL & CTRL+C / CTRL+D)
+// SERIAL REPL CONSOLE TASK (INTERACTIVE REPL)
 // =========================================================================
 static void console_read_task(void *pvParameter) {
     // Unbuffer stdout to guarantee immediate console response
@@ -109,9 +109,9 @@ static void console_read_task(void *pvParameter) {
     printf("  vol <0-100>      : Set speaker volume (e.g. 'vol 85')\n");
     printf("General Commands:\n");
     printf("  status           : Show servo angle, volume & IP\n");
+    printf("  reboot / restart : Restart ESP32-S3 board\n");
     printf("  help             : Show this help guide\n");
-    printf("  Ctrl+C           : Interrupt / Clear input\n");
-    printf("  Ctrl+D           : Soft Reboot (Restart board)\n");
+    printf("  Ctrl+C           : Clear current input line\n");
     printf("==================================================\n\n");
     printf("REPL> ");
     fflush(stdout);
@@ -126,24 +126,15 @@ static void console_read_task(void *pvParameter) {
             for (int i = 0; i < len; i++) {
                 uint8_t c = rx_buf[i];
 
-                // --- 1. Handle Ctrl+C (Interrupt) ---
+                // Handle Ctrl+C (Interrupt/Clear line)
                 if (c == 0x03) {
-                    printf("\n[Sent Ctrl+C - Interrupt]\nREPL> ");
+                    printf("\n[Sent Ctrl+C - Cleared]\nREPL> ");
                     fflush(stdout);
                     cmd_idx = 0;
                     continue;
                 }
 
-                // --- 2. Handle Ctrl+D (Soft Reboot) ---
-                if (c == 0x04) {
-                    printf("\n[Sent Ctrl+D - Soft Reboot]\n");
-                    printf("Rebooting ESP32-S3 now...\n");
-                    fflush(stdout);
-                    vTaskDelay(pdMS_TO_TICKS(150));
-                    esp_restart();
-                }
-
-                // --- 3. Handle Enter / Newline (Execute Command) ---
+                // Handle Enter / Newline (Execute Command)
                 if (c == '\r' || c == '\n') {
                     if (cmd_idx > 0) {
                         cmd_buf[cmd_idx] = '\0';
@@ -207,7 +198,6 @@ static void console_read_task(void *pvParameter) {
                             printf("  vol <0-100>      : Set volume percentage\n");
                             printf("  status           : Show device status\n");
                             printf("  reboot / restart : Restart ESP32-S3\n");
-                            printf("  Ctrl+C / Ctrl+D  : Cancel input / Soft reboot\n");
                         } else if (strcmp(p, "reboot") == 0 || strcmp(p, "restart") == 0) {
                             printf("Rebooting ESP32-S3...\n");
                             vTaskDelay(pdMS_TO_TICKS(100));
@@ -226,8 +216,8 @@ static void console_read_task(void *pvParameter) {
                         printf("\b \b");
                         fflush(stdout);
                     }
-                } else {
-                    // Store character and echo back
+                } else if (c >= 0x20 && c <= 0x7E) {
+                    // Store printable ASCII characters and echo back
                     if (cmd_idx < (int)sizeof(cmd_buf) - 1) {
                         cmd_buf[cmd_idx++] = (char)c;
                         putchar((char)c);
@@ -789,14 +779,14 @@ extern "C" void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // 1. Initialize HT517 I2S audio driver & background tasks
-    audio_player_init();
+    // 1. Initialize Wi-Fi stack & TCP/IP FIRST so lwIP sockets are ready
+    wifi_init_softap();
 
     // 2. Initialize hardware PWM on GPIO 4 for servo control
     servo_init();
 
-    // 3. Start Soft-AP Wi-Fi network
-    wifi_init_softap();
+    // 3. Initialize HT517 I2S audio driver & background tasks
+    audio_player_init();
 
     // 4. Start web server
     start_webserver();
