@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -77,6 +80,135 @@ static void servo_set_angle(int angle) {
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
 
     ESP_LOGI(TAG, "Angle set to %d deg (Duty: %lu)", angle, (unsigned long)duty);
+}
+
+// =========================================================================
+// SERIAL REPL CONSOLE TASK (INTERACTIVE REPL & CTRL+C / CTRL+D)
+// =========================================================================
+static void console_read_task(void *pvParameter) {
+    // Unbuffer stdout to guarantee immediate console response
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    // Set standard input to non-blocking mode
+    int fd = fileno(stdin);
+    int flags = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    printf("\n==================================================\n");
+    printf("   YD-ESP32-S3 Serial REPL Console Ready\n");
+    printf("==================================================\n");
+    printf("Commands:\n");
+    printf("  0 - 180   : Set servo angle directly (e.g. '90')\n");
+    printf("  angle <N> : Set angle (e.g. 'angle 45')\n");
+    printf("  status    : Show current servo angle & IP\n");
+    printf("  help      : Show this help guide\n");
+    printf("  Ctrl+C    : Interrupt / Clear input\n");
+    printf("  Ctrl+D    : Soft Reboot (Restart board)\n");
+    printf("==================================================\n\n");
+    printf("REPL> ");
+    fflush(stdout);
+
+    uint8_t rx_buf[64];
+    char cmd_buf[128];
+    int cmd_idx = 0;
+
+    while (1) {
+        int len = read(fd, rx_buf, sizeof(rx_buf));
+        if (len > 0) {
+            for (int i = 0; i < len; i++) {
+                uint8_t c = rx_buf[i];
+
+                // --- 1. Handle Ctrl+C (Interrupt) ---
+                if (c == 0x03) {
+                    printf("\n[Sent Ctrl+C - Interrupt]\nREPL> ");
+                    fflush(stdout);
+                    cmd_idx = 0;
+                    continue;
+                }
+
+                // --- 2. Handle Ctrl+D (Soft Reboot) ---
+                if (c == 0x04) {
+                    printf("\n[Sent Ctrl+D - Soft Reboot]\n");
+                    printf("Rebooting ESP32-S3 now...\n");
+                    fflush(stdout);
+                    vTaskDelay(pdMS_TO_TICKS(150));
+                    esp_restart();
+                }
+
+                // --- 3. Handle Enter / Newline (Execute Command) ---
+                if (c == '\r' || c == '\n') {
+                    if (cmd_idx > 0) {
+                        cmd_buf[cmd_idx] = '\0';
+                        printf("\n");
+
+                        // Strip leading whitespace
+                        char *p = cmd_buf;
+                        while (*p == ' ' || *p == '\t') p++;
+
+                        // Check if input is a pure number (0 - 180)
+                        bool is_numeric = true;
+                        int p_len = strlen(p);
+                        if (p_len == 0) is_numeric = false;
+                        for (int j = 0; j < p_len; j++) {
+                            if (!isdigit((unsigned char)p[j])) {
+                                is_numeric = false;
+                                break;
+                            }
+                        }
+
+                        if (is_numeric) {
+                            int req_angle = atoi(p);
+                            if (req_angle >= 0 && req_angle <= 180) {
+                                servo_set_angle(req_angle);
+                                printf(">> Servo moved to %d deg\n", req_angle);
+                            } else {
+                                printf(">> Error: Angle must be between 0 and 180 degrees.\n");
+                            }
+                        } else if (strncmp(p, "angle ", 6) == 0) {
+                            int req_angle = atoi(p + 6);
+                            if (req_angle >= 0 && req_angle <= 180) {
+                                servo_set_angle(req_angle);
+                                printf(">> Servo moved to %d deg\n", req_angle);
+                            } else {
+                                printf(">> Error: Angle must be between 0 and 180 degrees.\n");
+                            }
+                        } else if (strcmp(p, "status") == 0) {
+                            printf(">> Current Servo Angle: %d deg\n", current_servo_angle);
+                            printf(">> Web Dashboard: http://192.168.4.1/\n");
+                        } else if (strcmp(p, "help") == 0 || strcmp(p, "?") == 0) {
+                            printf("Commands: 0-180, 'angle <N>', 'status', 'help', Ctrl+C, Ctrl+D\n");
+                        } else if (strcmp(p, "reboot") == 0 || strcmp(p, "restart") == 0) {
+                            printf("Rebooting...\n");
+                            vTaskDelay(pdMS_TO_TICKS(100));
+                            esp_restart();
+                        } else {
+                            printf(">> Unknown command: '%s'. Enter a number (0-180) or 'help'.\n", p);
+                        }
+
+                        cmd_idx = 0;
+                        printf("REPL> ");
+                        fflush(stdout);
+                    }
+                } else if (c == 0x08 || c == 0x7F) { // Backspace
+                    if (cmd_idx > 0) {
+                        cmd_idx--;
+                        printf("\b \b");
+                        fflush(stdout);
+                    }
+                } else {
+                    // Store character and echo back
+                    if (cmd_idx < (int)sizeof(cmd_buf) - 1) {
+                        cmd_buf[cmd_idx++] = (char)c;
+                        putchar((char)c);
+                        fflush(stdout);
+                    }
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 }
 
 // =========================================================================
@@ -382,7 +514,6 @@ static void wifi_init_softap(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // Automatically assigns 192.168.4.1 / 255.255.255.0 and starts DHCPS
     esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -416,7 +547,15 @@ extern "C" void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    // 1. Initialize hardware PWM on GPIO 4
     servo_init();
+
+    // 2. Start Soft-AP Wi-Fi network
     wifi_init_softap();
+
+    // 3. Start web server
     start_webserver();
+
+    // 4. Start serial input task for interactive REPL control
+    xTaskCreate(console_read_task, "console_read_task", 4096, NULL, 5, NULL);
 }
