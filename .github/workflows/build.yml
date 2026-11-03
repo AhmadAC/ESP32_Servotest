@@ -1,0 +1,81 @@
+name: Build YD-ESP32-S3 Servo Firmware
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Compile ESP-IDF Firmware
+    runs-on: ubuntu-latest
+    container: espressif/idf:release-v5.2
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Build Firmware
+        shell: bash
+        run: |
+          # 1. Load ESP-IDF environment variables
+          . /opt/esp/idf/export.sh
+
+          # 2. Fix git safe directory warning inside container
+          git config --global --add safe.directory "*"
+
+          # 3. Create clean output directory for compiled binaries
+          mkdir -p build_out
+
+          echo "=========================================="
+          echo "Building YD-ESP32-S3 Servo Project"
+          echo "=========================================="
+
+          # 4. Set target to ESP32-S3
+          idf.py set-target esp32s3
+
+          # 5. Build project
+          idf.py build
+
+          # 6. Copy bootloader and partition table
+          cp "build/bootloader/bootloader.bin" "build_out/" 2>/dev/null || true
+          cp "build/partition_table/partition-table.bin" "build_out/partition-table.bin" 2>/dev/null || true
+          cp "build/partition_table/partition-table.bin" "build_out/partitions.bin" 2>/dev/null || true
+
+          # 7. Locate and copy the compiled app binary
+          app_bin=$(find build -maxdepth 1 -name "*.bin" ! -name "bootloader.bin" ! -name "partition-table.bin" ! -name "partitions.bin" -exec basename {} \;)
+
+          if [ -z "$app_bin" ]; then
+              app_bin="esp32s3_servo_server.bin"
+          fi
+
+          cp "build/${app_bin}" "build_out/" 2>/dev/null || true
+
+          # 8. Generate a Web Flasher manifest.json for WebSerial flashing
+          echo "Generating Web Flasher manifest.json..."
+          cat <<EOF > build_out/manifest.json
+          {
+            "name": "YD-ESP32-S3 Servo Controller",
+            "version": "1.0.0",
+            "builds": [
+              {
+                "chipFamily": "ESP32-S3",
+                "parts": [
+                  { "path": "bootloader.bin", "offset": 0 },
+                  { "path": "partitions.bin", "offset": 32768 },
+                  { "path": "${app_bin}", "offset": 65536 }
+                ]
+              }
+            ]
+          }
+          EOF
+
+      - name: Upload Firmware Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: yd_esp32_s3_servo_binaries
+          path: build_out/
