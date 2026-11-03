@@ -1,4 +1,30 @@
-Servo Lead	Color (Typical)	YD-ESP32-S3 v1.3 Pin	Notes
-GND	Black / Brown	GND	Common ground
-VCC	Red	5V / VBUS	Power from 5V (USB or external supply)
-Signal (PWM)	Orange / Yellow	GPIO 4 (GP4)	50Hz LEDC hardware signal
+================================================================================
+                    YD-ESP32-S3 HARDWARE PINOUT MAPPING
+================================================================================
+
+1. SERVO MOTOR WIRING:
+--------------------------------------------------------------------------------
+Servo Lead      Color (Typical)     YD-ESP32-S3 Pin     Notes
+GND             Black / Brown       GND                 Common Ground
+VCC             Red                 5V / VBUS           Power from 5V (USB or external supply)
+Signal (PWM)    Orange / Yellow     GPIO 4 (GP4)        50Hz LEDC hardware PWM signal
+
+
+2. HT517 I2S AMPLIFIER WIRING:
+--------------------------------------------------------------------------------
+HT517 Pin       Function            YD-ESP32-S3 Pin     Notes
+BCLK / SCK      Bit Clock           GPIO 10             I2S Channel 0 Clock
+LRC / WS        Word Select / L-R   GPIO 11             I2S Left / Right Frame Sync
+DIN / SD        Serial Data In      GPIO 12             I2S Audio Data Stream
+VCC             Power Supply        5V / 3.3V           5V recommended for full volume
+GND             Ground              GND                 Common Ground
+
+
+3. OPTIONAL PDM MICROPHONE WIRING:
+--------------------------------------------------------------------------------
+Mic Pin         Function            YD-ESP32-S3 Pin     Notes
+CLK             Clock               GPIO 42             PDM Clock Output
+DAT             Data                GPIO 41             PDM Data Input
+VCC             Power               3.3V
+GND             Ground              GND
+================================================================================

@@ -2,9 +2,9 @@ name: Build YD-ESP32-S3 Servo Firmware
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "Speaker", "main", "master" ]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: [ "Speaker", "main", "master" ]
   workflow_dispatch:
 
 jobs:
@@ -32,13 +32,13 @@ jobs:
           mkdir -p build_out
 
           echo "=========================================="
-          echo "Building YD-ESP32-S3 Servo Project"
+          echo "Building YD-ESP32-S3 Servo & Audio Project"
           echo "=========================================="
 
           # 4. Set target to ESP32-S3
           idf.py set-target esp32s3
 
-          # 5. Build project
+          # 5. Build project (compiles app, embeds WAV, and links I2S/Servo drivers)
           idf.py build
 
           # 6. Copy bootloader and partition table
@@ -59,7 +59,7 @@ jobs:
           echo "Generating Web Flasher manifest.json..."
           cat <<EOF > build_out/manifest.json
           {
-            "name": "YD-ESP32-S3 Servo Controller",
+            "name": "YD-ESP32-S3 Servo & Audio Controller",
             "version": "1.0.0",
             "builds": [
               {

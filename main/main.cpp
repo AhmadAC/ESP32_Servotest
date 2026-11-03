@@ -14,8 +14,9 @@
 #include "esp_netif.h"
 #include "esp_http_server.h"
 #include "driver/ledc.h"
+#include "audio_player.h"
 
-static const char *TAG = "SERVO_WEB";
+static const char *TAG = "MAIN_APP";
 
 // =========================================================================
 // HARDWARE PIN CONFIGURATION
@@ -99,13 +100,18 @@ static void console_read_task(void *pvParameter) {
     printf("\n==================================================\n");
     printf("   YD-ESP32-S3 Serial REPL Console Ready\n");
     printf("==================================================\n");
-    printf("Commands:\n");
-    printf("  0 - 180   : Set servo angle directly (e.g. '90')\n");
-    printf("  angle <N> : Set angle (e.g. 'angle 45')\n");
-    printf("  status    : Show current servo angle & IP\n");
-    printf("  help      : Show this help guide\n");
-    printf("  Ctrl+C    : Interrupt / Clear input\n");
-    printf("  Ctrl+D    : Soft Reboot (Restart board)\n");
+    printf("Servo Commands:\n");
+    printf("  0 - 180          : Set servo angle directly (e.g. '90')\n");
+    printf("  angle <N>        : Set servo angle (e.g. 'angle 45')\n");
+    printf("Speaker Audio Commands:\n");
+    printf("  bark / play      : Play dog bark sound on HT517 speaker\n");
+    printf("  stop             : Stop audio playback\n");
+    printf("  vol <0-100>      : Set speaker volume (e.g. 'vol 85')\n");
+    printf("General Commands:\n");
+    printf("  status           : Show servo angle, volume & IP\n");
+    printf("  help             : Show this help guide\n");
+    printf("  Ctrl+C           : Interrupt / Clear input\n");
+    printf("  Ctrl+D           : Soft Reboot (Restart board)\n");
     printf("==================================================\n\n");
     printf("REPL> ");
     fflush(stdout);
@@ -174,17 +180,40 @@ static void console_read_task(void *pvParameter) {
                             } else {
                                 printf(">> Error: Angle must be between 0 and 180 degrees.\n");
                             }
+                        } else if (strcmp(p, "bark") == 0 || strcmp(p, "play") == 0 || strcmp(p, "sound") == 0) {
+                            audio_play("dog_bark");
+                            printf(">> Playing dog bark on HT517 speaker (Volume: %d%%)\n", audio_get_volume());
+                        } else if (strcmp(p, "stop") == 0) {
+                            audio_stop();
+                            printf(">> Audio playback stopped.\n");
+                        } else if (strncmp(p, "vol ", 4) == 0 || strncmp(p, "volume ", 7) == 0) {
+                            int req_vol = (strncmp(p, "vol ", 4) == 0) ? atoi(p + 4) : atoi(p + 7);
+                            if (req_vol >= 0 && req_vol <= 100) {
+                                audio_set_volume(req_vol);
+                                printf(">> Speaker volume set to %d%%\n", req_vol);
+                            } else {
+                                printf(">> Error: Volume must be between 0 and 100.\n");
+                            }
                         } else if (strcmp(p, "status") == 0) {
-                            printf(">> Current Servo Angle: %d deg\n", current_servo_angle);
-                            printf(">> Web Dashboard: http://192.168.4.1/\n");
+                            printf(">> Current Servo Angle : %d deg\n", current_servo_angle);
+                            printf(">> Current Speaker Vol : %d%%\n", audio_get_volume());
+                            printf(">> Web Dashboard       : http://192.168.4.1/\n");
                         } else if (strcmp(p, "help") == 0 || strcmp(p, "?") == 0) {
-                            printf("Commands: 0-180, 'angle <N>', 'status', 'help', Ctrl+C, Ctrl+D\n");
+                            printf("Available Commands:\n");
+                            printf("  0 - 180          : Direct servo angle\n");
+                            printf("  angle <N>        : Set servo angle\n");
+                            printf("  bark / play      : Play dog bark sound\n");
+                            printf("  stop             : Stop speaker playback\n");
+                            printf("  vol <0-100>      : Set volume percentage\n");
+                            printf("  status           : Show device status\n");
+                            printf("  reboot / restart : Restart ESP32-S3\n");
+                            printf("  Ctrl+C / Ctrl+D  : Cancel input / Soft reboot\n");
                         } else if (strcmp(p, "reboot") == 0 || strcmp(p, "restart") == 0) {
-                            printf("Rebooting...\n");
+                            printf("Rebooting ESP32-S3...\n");
                             vTaskDelay(pdMS_TO_TICKS(100));
                             esp_restart();
                         } else {
-                            printf(">> Unknown command: '%s'. Enter a number (0-180) or 'help'.\n", p);
+                            printf(">> Unknown command: '%s'. Enter a number (0-180), 'bark', 'vol 80', or 'help'.\n", p);
                         }
 
                         cmd_idx = 0;
@@ -220,15 +249,23 @@ static const char INDEX_HTML[] = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>YD-ESP32-S3 Servo Dashboard</title>
+    <title>YD-ESP32-S3 Controller</title>
     <style>
         :root {
-            --bg-color: #0f172a;
+            --bg-color: #0b1120;
             --card-color: #1e293b;
+            --card-border: #334155;
             --primary: #38bdf8;
-            --accent: #0284c7;
+            --primary-hover: #0284c7;
+            --accent: #10b981;
+            --accent-hover: #059669;
+            --danger: #ef4444;
+            --danger-hover: #dc2626;
             --text-color: #f8fafc;
             --muted-text: #94a3b8;
+        }
+        * {
+            box-sizing: border-box;
         }
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -239,57 +276,72 @@ static const char INDEX_HTML[] = R"rawliteral(
             align-items: center;
             justify-content: center;
             min-height: 100vh;
-            padding: 16px;
-            box-sizing: border-box;
+            padding: 20px 16px;
         }
         .container {
             background-color: var(--card-color);
             width: 100%;
-            max-width: 440px;
+            max-width: 460px;
             border-radius: 20px;
-            padding: 30px;
-            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
-            border: 1px solid #334155;
+            padding: 26px 24px;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.6);
+            border: 1px solid var(--card-border);
             text-align: center;
         }
         h1 {
-            font-size: 1.4rem;
-            margin-bottom: 6px;
+            font-size: 1.45rem;
+            margin: 0 0 4px 0;
             color: var(--primary);
         }
         .sub-header {
-            font-size: 0.85rem;
+            font-size: 0.8rem;
             color: var(--muted-text);
-            margin-bottom: 24px;
+            margin-bottom: 20px;
         }
-        .dial-container {
-            margin: 20px 0;
+        .section-box {
+            background: #0f172a;
+            border: 1px solid var(--card-border);
+            border-radius: 14px;
+            padding: 16px;
+            margin-bottom: 18px;
         }
-        .angle-readout {
-            font-size: 3.8rem;
+        .section-title {
+            font-size: 0.8rem;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--muted-text);
+            margin-bottom: 12px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .readout {
+            font-size: 3.2rem;
             font-weight: 700;
             color: var(--text-color);
             font-variant-numeric: tabular-nums;
+            line-height: 1.1;
         }
-        .angle-unit {
-            font-size: 1.5rem;
+        .readout-unit {
+            font-size: 1.4rem;
             color: var(--primary);
         }
-        .slider-container {
-            margin: 25px 0 15px 0;
+        .slider-wrap {
+            margin: 16px 0 8px 0;
         }
         input[type=range] {
             -webkit-appearance: none;
             width: 100%;
-            height: 12px;
+            height: 10px;
             border-radius: 6px;
             background: #334155;
             outline: none;
         }
         input[type=range]::-webkit-slider-thumb {
             -webkit-appearance: none;
-            width: 32px;
-            height: 32px;
+            width: 28px;
+            height: 28px;
             border-radius: 50%;
             background: var(--primary);
             cursor: pointer;
@@ -299,33 +351,55 @@ static const char INDEX_HTML[] = R"rawliteral(
         .range-labels {
             display: flex;
             justify-content: space-between;
-            font-size: 0.85rem;
+            font-size: 0.75rem;
             color: var(--muted-text);
-            margin-top: 8px;
+            margin-top: 6px;
         }
         .btn-grid {
             display: grid;
             grid-template-columns: repeat(5, 1fr);
-            gap: 8px;
-            margin-top: 24px;
+            gap: 6px;
+            margin-top: 14px;
+        }
+        .audio-btn-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-top: 14px;
         }
         button {
             background: #334155;
             border: none;
             border-radius: 10px;
             color: var(--text-color);
-            padding: 12px 4px;
+            padding: 10px 4px;
             font-weight: 600;
             font-size: 0.85rem;
             cursor: pointer;
             transition: all 0.15s ease;
         }
         button:hover {
-            background: var(--accent);
+            background: var(--primary-hover);
             color: #ffffff;
         }
         button:active {
             transform: scale(0.96);
+        }
+        .btn-bark {
+            background: var(--accent);
+            padding: 14px 10px;
+            font-size: 0.95rem;
+        }
+        .btn-bark:hover {
+            background: var(--accent-hover);
+        }
+        .btn-stop {
+            background: #475569;
+            padding: 14px 10px;
+            font-size: 0.95rem;
+        }
+        .btn-stop:hover {
+            background: var(--danger-hover);
         }
         .status-dot {
             display: inline-block;
@@ -336,7 +410,7 @@ static const char INDEX_HTML[] = R"rawliteral(
             margin-right: 6px;
         }
         .status-bar {
-            margin-top: 20px;
+            margin-top: 14px;
             font-size: 0.8rem;
             color: var(--muted-text);
         }
@@ -344,62 +418,93 @@ static const char INDEX_HTML[] = R"rawliteral(
 </head>
 <body>
     <div class="container">
-        <h1>YD-ESP32-S3 Servo</h1>
-        <div class="sub-header">LEDC 50Hz PWM on GPIO 4</div>
+        <h1>YD-ESP32-S3 Dashboard</h1>
+        <div class="sub-header">Servo (GPIO 4) &amp; HT517 I2S Speaker (GPIO 10,11,12)</div>
 
-        <div class="dial-container">
-            <span class="angle-readout" id="angleVal">90</span><span class="angle-unit">&deg;</span>
-        </div>
+        <!-- SERVO MOTOR CONTROL SECTION -->
+        <div class="section-box">
+            <div class="section-title">
+                <span>Servo Position</span>
+                <span style="color: var(--primary);">LEDC 50Hz</span>
+            </div>
+            <div>
+                <span class="readout" id="angleVal">90</span><span class="readout-unit">&deg;</span>
+            </div>
 
-        <div class="slider-container">
-            <input type="range" id="angleSlider" min="0" max="180" value="90" oninput="onSliderMove(this.value)" onchange="sendAngle(this.value)">
-            <div class="range-labels">
-                <span>0&deg;</span>
-                <span>45&deg;</span>
-                <span>90&deg;</span>
-                <span>135&deg;</span>
-                <span>180&deg;</span>
+            <div class="slider-wrap">
+                <input type="range" id="angleSlider" min="0" max="180" value="90" oninput="onAngleSliderMove(this.value)" onchange="sendAngle(this.value)">
+                <div class="range-labels">
+                    <span>0&deg;</span>
+                    <span>45&deg;</span>
+                    <span>90&deg;</span>
+                    <span>135&deg;</span>
+                    <span>180&deg;</span>
+                </div>
+            </div>
+
+            <div class="btn-grid">
+                <button onclick="setAngle(0)">0&deg;</button>
+                <button onclick="setAngle(45)">45&deg;</button>
+                <button onclick="setAngle(90)">90&deg;</button>
+                <button onclick="setAngle(135)">135&deg;</button>
+                <button onclick="setAngle(180)">180&deg;</button>
             </div>
         </div>
 
-        <div class="btn-grid">
-            <button onclick="setAngle(0)">0&deg;</button>
-            <button onclick="setAngle(45)">45&deg;</button>
-            <button onclick="setAngle(90)">90&deg;</button>
-            <button onclick="setAngle(135)">135&deg;</button>
-            <button onclick="setAngle(180)">180&deg;</button>
+        <!-- HT517 I2S SPEAKER AUDIO CONTROL SECTION -->
+        <div class="section-box">
+            <div class="section-title">
+                <span>Speaker Audio</span>
+                <span style="color: var(--accent);">HT517 Amp</span>
+            </div>
+
+            <div style="margin-bottom: 8px;">
+                <span style="font-size: 1.1rem; font-weight: 600; color: var(--muted-text);">Volume: </span>
+                <span style="font-size: 1.4rem; font-weight: 700; color: var(--text-color);" id="volVal">80</span>
+                <span style="font-size: 1.1rem; color: var(--primary);">%</span>
+            </div>
+
+            <div class="slider-wrap">
+                <input type="range" id="volSlider" min="0" max="100" value="80" oninput="onVolSliderMove(this.value)" onchange="sendVolume(this.value)">
+                <div class="range-labels">
+                    <span>Mute</span>
+                    <span>25%</span>
+                    <span>50%</span>
+                    <span>75%</span>
+                    <span>100%</span>
+                </div>
+            </div>
+
+            <div class="audio-btn-grid">
+                <button class="btn-bark" onclick="playBark()">&#128054; Play Bark</button>
+                <button class="btn-stop" onclick="stopAudio()">&#9209; Stop Audio</button>
+            </div>
         </div>
 
         <div class="status-bar">
-            <span class="status-dot"></span><span id="connStatus">Ready</span>
+            <span class="status-dot"></span><span id="connStatus">System Ready</span>
         </div>
     </div>
 
     <script>
         let pendingAngle = null;
-        let isThrottled = false;
+        let isAngleThrottled = false;
 
-        function updateDisplay(val) {
+        let pendingVol = null;
+        let isVolThrottled = false;
+
+        function updateAngleDisplay(val) {
             document.getElementById("angleVal").innerText = val;
             document.getElementById("angleSlider").value = val;
         }
 
-        function onSliderMove(val) {
+        function onAngleSliderMove(val) {
             document.getElementById("angleVal").innerText = val;
-            throttleSend(val);
-        }
-
-        function setAngle(val) {
-            updateDisplay(val);
-            sendAngle(val);
-        }
-
-        function throttleSend(val) {
-            if (!isThrottled) {
+            if (!isAngleThrottled) {
                 sendAngle(val);
-                isThrottled = true;
+                isAngleThrottled = true;
                 setTimeout(() => {
-                    isThrottled = false;
+                    isAngleThrottled = false;
                     if (pendingAngle !== null) {
                         sendAngle(pendingAngle);
                         pendingAngle = null;
@@ -410,15 +515,78 @@ static const char INDEX_HTML[] = R"rawliteral(
             }
         }
 
+        function setAngle(val) {
+            updateAngleDisplay(val);
+            sendAngle(val);
+        }
+
         function sendAngle(val) {
-            document.getElementById("connStatus").innerText = "Updating...";
+            document.getElementById("connStatus").innerText = "Updating servo...";
             fetch(`/set?angle=${val}`)
                 .then(res => res.text())
                 .then(text => {
-                    document.getElementById("connStatus").innerText = "Angle: " + val + "°";
+                    document.getElementById("connStatus").innerText = "Servo Angle: " + val + "°";
                 })
                 .catch(err => {
-                    document.getElementById("connStatus").innerText = "Communication error";
+                    document.getElementById("connStatus").innerText = "Servo communication error";
+                });
+        }
+
+        function updateVolDisplay(val) {
+            document.getElementById("volVal").innerText = val;
+            document.getElementById("volSlider").value = val;
+        }
+
+        function onVolSliderMove(val) {
+            document.getElementById("volVal").innerText = val;
+            if (!isVolThrottled) {
+                sendVolume(val);
+                isVolThrottled = true;
+                setTimeout(() => {
+                    isVolThrottled = false;
+                    if (pendingVol !== null) {
+                        sendVolume(pendingVol);
+                        pendingVol = null;
+                    }
+                }, 80);
+            } else {
+                pendingVol = val;
+            }
+        }
+
+        function sendVolume(val) {
+            document.getElementById("connStatus").innerText = "Setting volume...";
+            fetch(`/volume?val=${val}`)
+                .then(res => res.text())
+                .then(text => {
+                    document.getElementById("connStatus").innerText = "Volume: " + val + "%";
+                })
+                .catch(err => {
+                    document.getElementById("connStatus").innerText = "Volume error";
+                });
+        }
+
+        function playBark() {
+            document.getElementById("connStatus").innerText = "Playing dog bark...";
+            fetch('/play?sound=dog_bark')
+                .then(res => res.text())
+                .then(text => {
+                    document.getElementById("connStatus").innerText = "Playing dog bark audio";
+                })
+                .catch(err => {
+                    document.getElementById("connStatus").innerText = "Audio playback request failed";
+                });
+        }
+
+        function stopAudio() {
+            document.getElementById("connStatus").innerText = "Stopping audio...";
+            fetch('/stop')
+                .then(res => res.text())
+                .then(text => {
+                    document.getElementById("connStatus").innerText = "Audio stopped";
+                })
+                .catch(err => {
+                    document.getElementById("connStatus").innerText = "Stop command failed";
                 });
         }
 
@@ -427,8 +595,14 @@ static const char INDEX_HTML[] = R"rawliteral(
                 .then(res => res.json())
                 .then(data => {
                     if (data.angle !== undefined) {
-                        updateDisplay(data.angle);
+                        updateAngleDisplay(data.angle);
                     }
+                    if (data.volume !== undefined) {
+                        updateVolDisplay(data.volume);
+                    }
+                })
+                .catch(err => {
+                    console.log("Failed to load initial status", err);
                 });
         };
     </script>
@@ -465,18 +639,65 @@ static esp_err_t set_angle_handler(httpd_req_t *req) {
     return ESP_FAIL;
 }
 
-static esp_err_t get_angle_handler(httpd_req_t *req) {
-    char json_resp[48];
-    snprintf(json_resp, sizeof(json_resp), "{\"angle\":%d}", current_servo_angle);
+static esp_err_t get_status_handler(httpd_req_t *req) {
+    char json_resp[64];
+    snprintf(json_resp, sizeof(json_resp), "{\"angle\":%d,\"volume\":%d}", current_servo_angle, audio_get_volume());
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json_resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
+static esp_err_t play_sound_handler(httpd_req_t *req) {
+    char query[64] = {0};
+    char sound[32] = "dog_bark";
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char param[32] = {0};
+        if (httpd_query_key_value(query, "sound", param, sizeof(param)) == ESP_OK) {
+            strncpy(sound, param, sizeof(sound) - 1);
+        }
+    }
+
+    audio_play(sound);
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, "PLAYING", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t stop_sound_handler(httpd_req_t *req) {
+    audio_stop();
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, "STOPPED", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t set_volume_handler(httpd_req_t *req) {
+    char query[64] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char param[16] = {0};
+        if (httpd_query_key_value(query, "val", param, sizeof(param)) == ESP_OK ||
+            httpd_query_key_value(query, "volume", param, sizeof(param)) == ESP_OK) {
+            int vol = atoi(param);
+            if (vol < 0) vol = 0;
+            if (vol > 100) vol = 100;
+            audio_set_volume(vol);
+
+            char resp[32];
+            snprintf(resp, sizeof(resp), "OK %d", vol);
+            httpd_resp_set_type(req, "text/plain");
+            httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+            return ESP_OK;
+        }
+    }
+
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing 'val' query param");
+    return ESP_FAIL;
+}
+
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 10;
     config.lru_purge_enable = true;
 
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -497,9 +718,30 @@ static void start_webserver(void) {
         httpd_uri_t uri_get = {};
         uri_get.uri      = "/get";
         uri_get.method   = HTTP_GET;
-        uri_get.handler  = get_angle_handler;
+        uri_get.handler  = get_status_handler;
         uri_get.user_ctx = NULL;
         httpd_register_uri_handler(server, &uri_get);
+
+        httpd_uri_t uri_play = {};
+        uri_play.uri      = "/play";
+        uri_play.method   = HTTP_GET;
+        uri_play.handler  = play_sound_handler;
+        uri_play.user_ctx = NULL;
+        httpd_register_uri_handler(server, &uri_play);
+
+        httpd_uri_t uri_stop = {};
+        uri_stop.uri      = "/stop";
+        uri_stop.method   = HTTP_GET;
+        uri_stop.handler  = stop_sound_handler;
+        uri_stop.user_ctx = NULL;
+        httpd_register_uri_handler(server, &uri_stop);
+
+        httpd_uri_t uri_volume = {};
+        uri_volume.uri      = "/volume";
+        uri_volume.method   = HTTP_GET;
+        uri_volume.handler  = set_volume_handler;
+        uri_volume.user_ctx = NULL;
+        httpd_register_uri_handler(server, &uri_volume);
 
         ESP_LOGI(TAG, "HTTP Server active on port %d", config.server_port);
     } else {
@@ -547,15 +789,18 @@ extern "C" void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // 1. Initialize hardware PWM on GPIO 4
+    // 1. Initialize HT517 I2S audio driver & background tasks
+    audio_player_init();
+
+    // 2. Initialize hardware PWM on GPIO 4 for servo control
     servo_init();
 
-    // 2. Start Soft-AP Wi-Fi network
+    // 3. Start Soft-AP Wi-Fi network
     wifi_init_softap();
 
-    // 3. Start web server
+    // 4. Start web server
     start_webserver();
 
-    // 4. Start serial input task for interactive REPL control
+    // 5. Start serial input task for interactive REPL control
     xTaskCreate(console_read_task, "console_read_task", 4096, NULL, 5, NULL);
 }
