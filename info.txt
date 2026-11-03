@@ -1,0 +1,4 @@
+Servo Lead	Color (Typical)	YD-ESP32-S3 v1.3 Pin	Notes
+GND	Black / Brown	GND	Common ground
+VCC	Red	5V / VBUS	Power from 5V (USB or external supply)
+Signal (PWM)	Orange / Yellow	GPIO 4 (GP4)	50Hz LEDC hardware signal

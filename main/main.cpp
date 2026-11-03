@@ -17,7 +17,6 @@ static const char *TAG = "SERVO_WEB";
 // =========================================================================
 // HARDWARE PIN CONFIGURATION
 // =========================================================================
-// GPIO 4 is broken out on the YD-ESP32-S3 header and is safe from strapping
 #define SERVO_PIN           GPIO_NUM_4
 #define LEDC_TIMER          LEDC_TIMER_0
 #define LEDC_MODE           LEDC_LOW_SPEED_MODE
@@ -46,24 +45,22 @@ static uint32_t angle_to_duty(int angle) {
 }
 
 static void servo_init(void) {
-    ledc_timer_config_t ledc_timer = {
-        .speed_mode       = LEDC_MODE,
-        .duty_resolution  = LEDC_DUTY_RES,
-        .timer_num        = LEDC_TIMER,
-        .freq_hz          = LEDC_FREQUENCY,
-        .clk_cfg          = LEDC_AUTO_CLK
-    };
+    ledc_timer_config_t ledc_timer = {};
+    ledc_timer.speed_mode       = LEDC_MODE;
+    ledc_timer.duty_resolution  = LEDC_DUTY_RES;
+    ledc_timer.timer_num        = LEDC_TIMER;
+    ledc_timer.freq_hz          = LEDC_FREQUENCY;
+    ledc_timer.clk_cfg          = LEDC_AUTO_CLK;
     ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
 
-    ledc_channel_config_t ledc_channel = {
-        .gpio_num       = SERVO_PIN,
-        .speed_mode     = LEDC_MODE,
-        .channel        = LEDC_CHANNEL,
-        .intr_type      = LEDC_INTR_DISABLE,
-        .timer_sel      = LEDC_TIMER,
-        .duty           = angle_to_duty(current_servo_angle),
-        .hpoint         = 0
-    };
+    ledc_channel_config_t ledc_channel = {};
+    ledc_channel.gpio_num       = SERVO_PIN;
+    ledc_channel.speed_mode     = LEDC_MODE;
+    ledc_channel.channel        = LEDC_CHANNEL;
+    ledc_channel.intr_type      = LEDC_INTR_DISABLE;
+    ledc_channel.timer_sel      = LEDC_TIMER;
+    ledc_channel.duty           = angle_to_duty(current_servo_angle);
+    ledc_channel.hpoint         = 0;
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 
     ESP_LOGI(TAG, "Servo hardware initialized on GPIO %d (default angle: %d deg)", SERVO_PIN, current_servo_angle);
@@ -247,7 +244,6 @@ static const char INDEX_HTML[] = R"rawliteral(
     </div>
 
     <script>
-        let lastSent = 0;
         let pendingAngle = null;
         let isThrottled = false;
 
@@ -294,7 +290,6 @@ static const char INDEX_HTML[] = R"rawliteral(
                 });
         }
 
-        // Fetch current hardware state on page load
         window.onload = function() {
             fetch('/get')
                 .then(res => res.json())
@@ -353,28 +348,25 @@ static void start_webserver(void) {
     config.lru_purge_enable = true;
 
     if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t uri_root = {
-            .uri      = "/",
-            .method   = HTTP_GET,
-            .handler  = root_get_handler,
-            .user_ctx = NULL
-        };
+        httpd_uri_t uri_root = {};
+        uri_root.uri      = "/";
+        uri_root.method   = HTTP_GET;
+        uri_root.handler  = root_get_handler;
+        uri_root.user_ctx = NULL;
         httpd_register_uri_handler(server, &uri_root);
 
-        httpd_uri_t uri_set = {
-            .uri      = "/set",
-            .method   = HTTP_GET,
-            .handler  = set_angle_handler,
-            .user_ctx = NULL
-        };
+        httpd_uri_t uri_set = {};
+        uri_set.uri      = "/set";
+        uri_set.method   = HTTP_GET;
+        uri_set.handler  = set_angle_handler;
+        uri_set.user_ctx = NULL;
         httpd_register_uri_handler(server, &uri_set);
 
-        httpd_uri_t uri_get = {
-            .uri      = "/get",
-            .method   = HTTP_GET,
-            .handler  = get_angle_handler,
-            .user_ctx = NULL
-        };
+        httpd_uri_t uri_get = {};
+        uri_get.uri      = "/get";
+        uri_get.method   = HTTP_GET;
+        uri_get.handler  = get_angle_handler;
+        uri_get.user_ctx = NULL;
         httpd_register_uri_handler(server, &uri_get);
 
         ESP_LOGI(TAG, "HTTP Server active on port %d", config.server_port);
@@ -390,16 +382,8 @@ static void wifi_init_softap(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
-
-    // Assign IP 192.168.4.1 to the SoftAP
-    esp_netif_ip_info_t ip_info;
-    IP4_ADDR(&ip_info.ip, 192, 168, 4, 1);
-    IP4_ADDR(&ip_info.gw, 192, 168, 4, 1);
-    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
-    esp_netif_dhcps_stop(ap_netif);
-    esp_netif_set_ip_info(ap_netif, &ip_info);
-    esp_netif_dhcps_start(ap_netif);
+    // Automatically assigns 192.168.4.1 / 255.255.255.0 and starts DHCPS
+    esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -409,7 +393,7 @@ static void wifi_init_softap(void) {
     wifi_config.ap.ssid_len = strlen("ESP32S3-Servo");
     wifi_config.ap.channel = 1;
     wifi_config.ap.max_connection = 4;
-    wifi_config.ap.authmode = WIFI_AUTH_OPEN; // Open network for zero-friction setup
+    wifi_config.ap.authmode = WIFI_AUTH_OPEN;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
@@ -425,7 +409,6 @@ static void wifi_init_softap(void) {
 // APPLICATION ENTRY POINT
 // =========================================================================
 extern "C" void app_main(void) {
-    // 1. Initialize NVS (required for Wi-Fi storage)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -433,12 +416,7 @@ extern "C" void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // 2. Initialize Servo Hardware on LEDC Timer 0 / GPIO 4
     servo_init();
-
-    // 3. Initialize SoftAP Wi-Fi
     wifi_init_softap();
-
-    // 4. Launch Web Server
     start_webserver();
 }
