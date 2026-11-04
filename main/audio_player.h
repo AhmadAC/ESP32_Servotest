@@ -13,6 +13,10 @@ void audio_play(const char *sound_name);
 void audio_play_test_beep(void);
 void audio_stop(void);
 
+// Hardware pin mapping configuration
+void audio_set_pins(int bclk, int lrc, int din);
+void audio_get_pins(int *bclk, int *lrc, int *din);
+
 #ifdef __cplusplus
 }
 #endif

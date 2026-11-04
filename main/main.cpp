@@ -15,6 +15,7 @@
 #include "esp_http_server.h"
 #include "driver/ledc.h"
 #include "driver/uart.h"
+#include "driver/usb_serial_jtag.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "lwip/err.h"
@@ -30,8 +31,8 @@ static const char *TAG = "MAIN_APP";
 #define LEDC_TIMER          LEDC_TIMER_0
 #define LEDC_MODE           LEDC_LOW_SPEED_MODE
 #define LEDC_CHANNEL        LEDC_CHANNEL_0
-#define LEDC_DUTY_RES       LEDC_TIMER_14_BIT // 16384 duty steps
-#define LEDC_FREQUENCY      50                // 50 Hz standard servo PWM (20ms period)
+#define LEDC_DUTY_RES       LEDC_TIMER_14_BIT
+#define LEDC_FREQUENCY      50
 
 #define SERVO_MIN_US        500
 #define SERVO_MAX_US        2500
@@ -110,7 +111,6 @@ static void dns_server_task(void *pvParameters) {
 
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (sock < 0) {
-        ESP_LOGE(TAG, "Failed to create DNS socket: %d", errno);
         vTaskDelete(NULL);
         return;
     }
@@ -119,13 +119,12 @@ static void dns_server_task(void *pvParameters) {
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     if (bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        ESP_LOGE(TAG, "DNS socket bind failed: %d", errno);
         close(sock);
         vTaskDelete(NULL);
         return;
     }
 
-    ESP_LOGI(TAG, "Captive DNS Server running on UDP port 53 -> Resolves all queries to 192.168.4.1");
+    ESP_LOGI(TAG, "Captive DNS Server running on UDP port 53");
 
     while (1) {
         struct sockaddr_in client_addr;
@@ -136,49 +135,40 @@ static void dns_server_task(void *pvParameters) {
         }
 
         dns_header_t *dns_hdr = (dns_header_t *)rx_buffer;
-        // Check if standard query (QR == 0)
         if ((ntohs(dns_hdr->flags) & 0x8000) != 0) {
             continue;
         }
 
-        // Parse Question section to find end of QNAME
         int qname_pos = sizeof(dns_header_t);
         while (qname_pos < len && rx_buffer[qname_pos] != 0) {
             qname_pos += rx_buffer[qname_pos] + 1;
         }
-        qname_pos++; // skip terminating 0 byte
-        int qend_pos = qname_pos + 4; // skip QTYPE (2) + QCLASS (2)
+        qname_pos++;
+        int qend_pos = qname_pos + 4;
 
         if (qend_pos > len || qend_pos + 16 > (int)sizeof(rx_buffer)) {
             continue;
         }
 
-        // Formulate standard DNS Answer pointing to 192.168.4.1
-        dns_hdr->flags    = htons(0x8180); // Standard response, recursion available, no error
+        dns_hdr->flags    = htons(0x8180);
         dns_hdr->qd_count = htons(1);
         dns_hdr->an_count = htons(1);
         dns_hdr->ns_count = 0;
         dns_hdr->ar_count = 0;
 
         uint8_t *ans = rx_buffer + qend_pos;
-        // Compression pointer to Question Name at offset 12 (0xC00C)
         ans[0] = 0xC0;
         ans[1] = 0x0C;
-        // TYPE: A (IPv4)
         ans[2] = 0x00;
         ans[3] = 0x01;
-        // CLASS: IN
         ans[4] = 0x00;
         ans[5] = 0x01;
-        // TTL: 60s
         ans[6] = 0x00;
         ans[7] = 0x00;
         ans[8] = 0x00;
         ans[9] = 0x3C;
-        // RDLENGTH: 4 bytes
         ans[10] = 0x00;
         ans[11] = 0x04;
-        // RDATA: 192.168.4.1
         ans[12] = 192;
         ans[13] = 168;
         ans[14] = 4;
@@ -190,18 +180,15 @@ static void dns_server_task(void *pvParameters) {
 }
 
 // =========================================================================
-// SERIAL CONSOLE TASK (USB SERIAL/JTAG + UART0 BIDIRECTIONAL REPL)
+// SERIAL CONSOLE TASK (NON-BLOCKING DUAL LISTEN: UART0 & USB SERIAL/JTAG)
 // =========================================================================
 static void console_print(const char *str) {
-    printf("%s", str);
-    fflush(stdout);
-    uart_write_bytes(UART_NUM_0, str, strlen(str));
+    size_t len = strlen(str);
+    uart_write_bytes(UART_NUM_0, str, len);
+    usb_serial_jtag_write_bytes(str, len, 0);
 }
 
 static void console_read_task(void *pvParameter) {
-    setvbuf(stdout, NULL, _IONBF, 0);
-
-    // Initialize UART0 driver on GPIO 43/44 so secondary UART COM port also works
     uart_config_t uart_cfg = {};
     uart_cfg.baud_rate = 115200;
     uart_cfg.data_bits = UART_DATA_8_BITS;
@@ -213,10 +200,8 @@ static void console_read_task(void *pvParameter) {
     uart_param_config(UART_NUM_0, &uart_cfg);
     uart_driver_install(UART_NUM_0, 512, 512, 0, NULL, 0);
 
-    // Set standard input to non-blocking
-    int fd = fileno(stdin);
-    int flags = fcntl(fd, F_GETFL);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    usb_serial_jtag_driver_config_t usbjtag_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    usb_serial_jtag_driver_install(&usbjtag_cfg);
 
     vTaskDelay(pdMS_TO_TICKS(400));
 
@@ -232,8 +217,11 @@ static void console_read_task(void *pvParameter) {
         "  beep / test      : Play diagnostic test beep on HT517\n"
         "  stop             : Stop speaker playback\n"
         "  vol <0-100>      : Set volume percentage (e.g. 'vol 85')\n"
+        "  pins 10 11 12    : Preset 1: YD Default (BCLK:10, LRC:11, DIN:12)\n"
+        "  pins 8 7 9       : Preset 2: Seeed Wiring (BCLK:8, LRC:7, DIN:9)\n"
+        "  pins 12 11 10    : Preset 3: Swapped Wiring (BCLK:12, LRC:11, DIN:10)\n"
         "General Commands:\n"
-        "  status           : Show servo angle, volume & Wi-Fi IP\n"
+        "  status           : Show servo angle, volume, pins & Wi-Fi IP\n"
         "  reboot / restart : Restart ESP32-S3 board\n"
         "  help             : Show command list\n"
         "==================================================\n"
@@ -247,25 +235,19 @@ static void console_read_task(void *pvParameter) {
         uint8_t c = 0;
         bool has_char = false;
 
-        // 1. Read from STDIN (USB Serial/JTAG primary console)
-        if (read(fd, &c, 1) > 0) {
+        if (uart_read_bytes(UART_NUM_0, &c, 1, 0) > 0) {
             has_char = true;
-        } else {
-            // 2. Read from UART0 (CH340/CH343 COM port)
-            if (uart_read_bytes(UART_NUM_0, &c, 1, 0) > 0) {
-                has_char = true;
-            }
+        } else if (usb_serial_jtag_read_bytes(&c, 1, 0) > 0) {
+            has_char = true;
         }
 
         if (has_char) {
-            // Handle Ctrl+C (Clear current line)
             if (c == 0x03) {
                 console_print("\n[Line Cleared]\nREPL> ");
                 cmd_idx = 0;
                 continue;
             }
 
-            // Handle Enter (Newline)
             if (c == '\r' || c == '\n') {
                 if (cmd_idx > 0) {
                     cmd_buf[cmd_idx] = '\0';
@@ -325,10 +307,23 @@ static void console_read_task(void *pvParameter) {
                         } else {
                             console_print(">> Error: Volume must be between 0 and 100.\n");
                         }
+                    } else if (strncmp(p, "pins ", 5) == 0) {
+                        int b = 0, l = 0, d = 0;
+                        if (sscanf(p + 5, "%d %d %d", &b, &l, &d) == 3) {
+                            audio_set_pins(b, l, d);
+                            char msg[64];
+                            snprintf(msg, sizeof(msg), ">> Audio pins updated: BCLK=%d, LRC=%d, DIN=%d\n", b, l, d);
+                            console_print(msg);
+                        } else {
+                            console_print(">> Usage: pins <bclk> <lrc> <din> (e.g. 'pins 10 11 12' or 'pins 8 7 9')\n");
+                        }
                     } else if (strcmp(p, "status") == 0) {
+                        int bclk = 10, lrc = 11, din = 12;
+                        audio_get_pins(&bclk, &lrc, &din);
                         char msg[128];
-                        snprintf(msg, sizeof(msg), ">> Servo: %d deg | Speaker Vol: %d%% | Web: http://192.168.4.1/\n",
-                                 current_servo_angle, audio_get_volume());
+                        snprintf(msg, sizeof(msg),
+                                 ">> Servo: %d deg | Vol: %d%% | Pins: BCLK=%d LRC=%d DIN=%d | Web: http://192.168.4.1/\n",
+                                 current_servo_angle, audio_get_volume(), bclk, lrc, din);
                         console_print(msg);
                     } else if (strcmp(p, "help") == 0 || strcmp(p, "?") == 0) {
                         console_print("Available Commands:\n"
@@ -337,6 +332,9 @@ static void console_read_task(void *pvParameter) {
                                       "  beep / test      : Play diagnostic beep\n"
                                       "  stop             : Stop speaker playback\n"
                                       "  vol <0-100>      : Set volume\n"
+                                      "  pins 10 11 12    : Use YD Default pins\n"
+                                      "  pins 8 7 9       : Use Seeed Wiring pins\n"
+                                      "  pins 12 11 10    : Use Swapped Wiring pins\n"
                                       "  status           : Show device status\n"
                                       "  reboot / restart : Restart ESP32-S3\n");
                     } else if (strcmp(p, "reboot") == 0 || strcmp(p, "restart") == 0) {
@@ -346,7 +344,7 @@ static void console_read_task(void *pvParameter) {
                     } else {
                         console_print(">> Unknown command: '");
                         console_print(p);
-                        console_print("'. Enter a number (0-180), 'bark', 'beep', or 'help'.\n");
+                        console_print("'. Enter a number (0-180), 'bark', 'beep', 'pins', or 'help'.\n");
                     }
 
                     cmd_idx = 0;
@@ -354,7 +352,7 @@ static void console_read_task(void *pvParameter) {
                 } else {
                     console_print("REPL> ");
                 }
-            } else if (c == 0x08 || c == 0x7F) { // Backspace
+            } else if (c == 0x08 || c == 0x7F) {
                 if (cmd_idx > 0) {
                     cmd_idx--;
                     console_print("\b \b");
@@ -367,7 +365,7 @@ static void console_read_task(void *pvParameter) {
                 }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(15));
     }
 }
 
@@ -492,7 +490,8 @@ static const char INDEX_HTML[] = R"rawliteral(
         .btn-bark { background: var(--accent); padding: 13px 8px; font-size: 0.92rem; }
         .btn-beep { background: #0284c7; padding: 13px 8px; font-size: 0.92rem; }
         .btn-stop { background: #475569; padding: 13px 8px; font-size: 0.92rem; grid-column: span 2; }
-        .btn-stop:active { background: var(--danger-hover); }
+        .btn-pin { background: #1e293b; border: 1px solid #475569; padding: 8px 6px; font-size: 0.72rem; color: #cbd5e1; border-radius: 8px; }
+        .btn-pin.active { background: #0284c7; border-color: #38bdf8; color: #fff; font-weight: bold; }
         .status-dot {
             display: inline-block;
             width: 8px;
@@ -507,7 +506,7 @@ static const char INDEX_HTML[] = R"rawliteral(
 <body>
     <div class="container">
         <h1>YD-ESP32-S3 Dashboard</h1>
-        <div class="sub-header">Servo (GPIO 4) &amp; HT517 Speaker (GPIO 10,11,12)</div>
+        <div class="sub-header">Servo (GPIO 4) &amp; HT517 Speaker Controller</div>
 
         <!-- SERVO MOTOR CONTROL SECTION -->
         <div class="section-box">
@@ -545,6 +544,16 @@ static const char INDEX_HTML[] = R"rawliteral(
                     <span>Mute</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
                 </div>
             </div>
+
+            <div style="margin: 10px 0 6px 0; text-align: left; font-size: 0.75rem; color: var(--muted-text);">
+                Hardware Pin Selection (Tap to Test):
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 12px;">
+                <button id="btnPinYD" class="btn-pin active" onclick="applyPins(10, 11, 12)">1: 10,11,12</button>
+                <button id="btnPinSeeed" class="btn-pin" onclick="applyPins(8, 7, 9)">2: 8,7,9</button>
+                <button id="btnPinSwap" class="btn-pin" onclick="applyPins(12, 11, 10)">3: 12,11,10</button>
+            </div>
+
             <div class="audio-btn-grid">
                 <button class="btn-bark" onclick="playBark()">&#128054; Dog Bark</button>
                 <button class="btn-beep" onclick="playBeep()">&#128276; Test Tone</button>
@@ -651,12 +660,38 @@ static const char INDEX_HTML[] = R"rawliteral(
                 .catch(e => { document.getElementById("connStatus").innerText = "Stop command error"; });
         }
 
+        function applyPins(b, l, d) {
+            document.getElementById("connStatus").innerText = "Switching audio pins...";
+            fetch(`/set_pins?bclk=${b}&lrc=${l}&din=${d}`)
+                .then(r => r.text())
+                .then(t => {
+                    document.getElementById("connStatus").innerText = `Pins: BCLK=${b}, LRC=${l}, DIN=${d}`;
+                    updatePinButtons(b, l);
+                    setTimeout(playBeep, 150);
+                });
+        }
+
+        function updatePinButtons(bclk, lrc) {
+            document.getElementById("btnPinYD").classList.remove("active");
+            document.getElementById("btnPinSeeed").classList.remove("active");
+            document.getElementById("btnPinSwap").classList.remove("active");
+
+            if (bclk === 8) {
+                document.getElementById("btnPinSeeed").classList.add("active");
+            } else if (bclk === 12) {
+                document.getElementById("btnPinSwap").classList.add("active");
+            } else {
+                document.getElementById("btnPinYD").classList.add("active");
+            }
+        }
+
         window.onload = function() {
             fetch('/get')
                 .then(r => r.json())
                 .then(data => {
                     if (data.angle !== undefined) updateAngleDisplay(data.angle);
                     if (data.volume !== undefined) updateVolDisplay(data.volume);
+                    if (data.bclk !== undefined) updatePinButtons(data.bclk, data.lrc);
                 })
                 .catch(err => { console.log("Init status error", err); });
         };
@@ -674,7 +709,6 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// Intercepts Apple CNA & Android probes and sends HTTP 302 Found to trigger auto-open
 static esp_err_t captive_redirect_handler(httpd_req_t *req) {
     httpd_resp_set_status(req, "302 Found");
     httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
@@ -711,8 +745,12 @@ static esp_err_t set_angle_handler(httpd_req_t *req) {
 }
 
 static esp_err_t get_status_handler(httpd_req_t *req) {
-    char json_resp[64];
-    snprintf(json_resp, sizeof(json_resp), "{\"angle\":%d,\"volume\":%d}", current_servo_angle, audio_get_volume());
+    int bclk = 10, lrc = 11, din = 12;
+    audio_get_pins(&bclk, &lrc, &din);
+    char json_resp[128];
+    snprintf(json_resp, sizeof(json_resp),
+             "{\"angle\":%d,\"volume\":%d,\"bclk\":%d,\"lrc\":%d,\"din\":%d}",
+             current_servo_angle, audio_get_volume(), bclk, lrc, din);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json_resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -769,16 +807,33 @@ static esp_err_t set_volume_handler(httpd_req_t *req) {
     return ESP_FAIL;
 }
 
+static esp_err_t set_pins_handler(httpd_req_t *req) {
+    char query[64] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char p_bclk[16] = {0}, p_lrc[16] = {0}, p_din[16] = {0};
+        httpd_query_key_value(query, "bclk", p_bclk, sizeof(p_bclk));
+        httpd_query_key_value(query, "lrc",  p_lrc,  sizeof(p_lrc));
+        httpd_query_key_value(query, "din",  p_din,  sizeof(p_din));
+        if (p_bclk[0] && p_lrc[0] && p_din[0]) {
+            audio_set_pins(atoi(p_bclk), atoi(p_lrc), atoi(p_din));
+            httpd_resp_set_type(req, "text/plain");
+            httpd_resp_send(req, "PINS_UPDATED", HTTPD_RESP_USE_STRLEN);
+            return ESP_OK;
+        }
+    }
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing pin params");
+    return ESP_FAIL;
+}
+
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 20; // Support app routes + captive portal routes
+    config.max_uri_handlers = 20;
     config.lru_purge_enable = true;
 
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_uri_t uri = {};
 
-        // Core application endpoints
         uri.uri = "/";
         uri.method = HTTP_GET;
         uri.handler = root_get_handler;
@@ -821,7 +876,12 @@ static void start_webserver(void) {
         uri.user_ctx = NULL;
         httpd_register_uri_handler(server, &uri);
 
-        // Apple iOS Captive Network Assistant detection endpoints
+        uri.uri = "/set_pins";
+        uri.method = HTTP_GET;
+        uri.handler = set_pins_handler;
+        uri.user_ctx = NULL;
+        httpd_register_uri_handler(server, &uri);
+
         uri.method = HTTP_GET;
         uri.handler = captive_redirect_handler;
         uri.user_ctx = NULL;
@@ -835,7 +895,6 @@ static void start_webserver(void) {
         uri.uri = "/library/test/success.html";
         httpd_register_uri_handler(server, &uri);
 
-        // Android / Windows / Chrome captive endpoints
         uri.uri = "/generate_204";
         httpd_register_uri_handler(server, &uri);
 
@@ -848,7 +907,6 @@ static void start_webserver(void) {
         uri.uri = "/connecttest.txt";
         httpd_register_uri_handler(server, &uri);
 
-        // Catch-all 404 handler redirecting all external domain requests to http://192.168.4.1/
         httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, http_404_error_handler);
 
         ESP_LOGI(TAG, "HTTP Server active on port 80 with Captive Portal redirection");
@@ -881,7 +939,6 @@ static void wifi_init_softap(void) {
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Disable Wi-Fi power save to prevent iPhone disconnections or packet latency
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     ESP_LOGI(TAG, "==================================================");
@@ -916,6 +973,6 @@ extern "C" void app_main(void) {
     // 5. Start HTTP web server with Captive Portal routes
     start_webserver();
 
-    // 6. Start bidirectional console task (USB Serial/JTAG + UART0)
+    // 6. Start non-blocking dual console task (USB Serial/JTAG + UART0)
     xTaskCreate(console_read_task, "console_read_task", 4096, NULL, 5, NULL);
 }
