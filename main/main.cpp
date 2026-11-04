@@ -14,6 +14,11 @@
 #include "esp_netif.h"
 #include "esp_http_server.h"
 #include "driver/ledc.h"
+#include "driver/uart.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
 #include "audio_player.h"
 
 static const char *TAG = "MAIN_APP";
@@ -25,10 +30,9 @@ static const char *TAG = "MAIN_APP";
 #define LEDC_TIMER          LEDC_TIMER_0
 #define LEDC_MODE           LEDC_LOW_SPEED_MODE
 #define LEDC_CHANNEL        LEDC_CHANNEL_0
-#define LEDC_DUTY_RES       LEDC_TIMER_14_BIT // 16384 total duty steps
+#define LEDC_DUTY_RES       LEDC_TIMER_14_BIT // 16384 duty steps
 #define LEDC_FREQUENCY      50                // 50 Hz standard servo PWM (20ms period)
 
-// 500us (0 deg) to 2500us (180 deg) mapping for 14-bit at 50Hz (20000us period)
 #define SERVO_MIN_US        500
 #define SERVO_MAX_US        2500
 
@@ -43,7 +47,6 @@ static uint32_t angle_to_duty(int angle) {
     if (angle > 180) angle = 180;
 
     uint32_t pulse_us = SERVO_MIN_US + ((SERVO_MAX_US - SERVO_MIN_US) * angle) / 180;
-    // Duty = (pulse_us / 20000us) * (2^14 - 1)
     uint32_t duty = (pulse_us * ((1 << 14) - 1)) / 20000;
     return duty;
 }
@@ -67,7 +70,7 @@ static void servo_init(void) {
     ledc_channel.hpoint         = 0;
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 
-    ESP_LOGI(TAG, "Servo hardware initialized on GPIO %d (default angle: %d deg)", SERVO_PIN, current_servo_angle);
+    ESP_LOGI(TAG, "Servo initialized on GPIO %d (Angle: %d deg)", SERVO_PIN, current_servo_angle);
 }
 
 static void servo_set_angle(int angle) {
@@ -80,165 +83,305 @@ static void servo_set_angle(int angle) {
     ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, duty));
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
 
-    ESP_LOGI(TAG, "Angle set to %d deg (Duty: %lu)", angle, (unsigned long)duty);
+    ESP_LOGI(TAG, "Servo moved to %d deg (duty: %lu)", angle, (unsigned long)duty);
 }
 
 // =========================================================================
-// SERIAL REPL CONSOLE TASK (INTERACTIVE REPL)
+// CAPTIVE PORTAL DNS SERVER (UDP PORT 53)
 // =========================================================================
-static void console_read_task(void *pvParameter) {
-    // Unbuffer stdout to guarantee immediate console response
-    setvbuf(stdout, NULL, _IONBF, 0);
+#pragma pack(push, 1)
+typedef struct {
+    uint16_t id;
+    uint16_t flags;
+    uint16_t qd_count;
+    uint16_t an_count;
+    uint16_t ns_count;
+    uint16_t ar_count;
+} dns_header_t;
+#pragma pack(pop)
 
-    // Set standard input to non-blocking mode
-    int fd = fileno(stdin);
-    int flags = fcntl(fd, F_GETFL);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+static void dns_server_task(void *pvParameters) {
+    uint8_t rx_buffer[512];
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(53);
 
-    vTaskDelay(pdMS_TO_TICKS(500));
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "Failed to create DNS socket: %d", errno);
+        vTaskDelete(NULL);
+        return;
+    }
 
-    printf("\n==================================================\n");
-    printf("   YD-ESP32-S3 Serial REPL Console Ready\n");
-    printf("==================================================\n");
-    printf("Servo Commands:\n");
-    printf("  0 - 180          : Set servo angle directly (e.g. '90')\n");
-    printf("  angle <N>        : Set servo angle (e.g. 'angle 45')\n");
-    printf("Speaker Audio Commands:\n");
-    printf("  bark / play      : Play dog bark sound on HT517 speaker\n");
-    printf("  stop             : Stop audio playback\n");
-    printf("  vol <0-100>      : Set speaker volume (e.g. 'vol 85')\n");
-    printf("General Commands:\n");
-    printf("  status           : Show servo angle, volume & IP\n");
-    printf("  reboot / restart : Restart ESP32-S3 board\n");
-    printf("  help             : Show this help guide\n");
-    printf("  Ctrl+C           : Clear current input line\n");
-    printf("==================================================\n\n");
-    printf("REPL> ");
-    fflush(stdout);
+    int opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    uint8_t rx_buf[64];
-    char cmd_buf[128];
-    int cmd_idx = 0;
+    if (bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        ESP_LOGE(TAG, "DNS socket bind failed: %d", errno);
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Captive DNS Server running on UDP port 53 -> Resolves all queries to 192.168.4.1");
 
     while (1) {
-        int len = read(fd, rx_buf, sizeof(rx_buf));
-        if (len > 0) {
-            for (int i = 0; i < len; i++) {
-                uint8_t c = rx_buf[i];
-
-                // Handle Ctrl+C (Interrupt/Clear line)
-                if (c == 0x03) {
-                    printf("\n[Sent Ctrl+C - Cleared]\nREPL> ");
-                    fflush(stdout);
-                    cmd_idx = 0;
-                    continue;
-                }
-
-                // Handle Enter / Newline (Execute Command)
-                if (c == '\r' || c == '\n') {
-                    if (cmd_idx > 0) {
-                        cmd_buf[cmd_idx] = '\0';
-                        printf("\n");
-
-                        // Strip leading whitespace
-                        char *p = cmd_buf;
-                        while (*p == ' ' || *p == '\t') p++;
-
-                        // Check if input is a pure number (0 - 180)
-                        bool is_numeric = true;
-                        int p_len = strlen(p);
-                        if (p_len == 0) is_numeric = false;
-                        for (int j = 0; j < p_len; j++) {
-                            if (!isdigit((unsigned char)p[j])) {
-                                is_numeric = false;
-                                break;
-                            }
-                        }
-
-                        if (is_numeric) {
-                            int req_angle = atoi(p);
-                            if (req_angle >= 0 && req_angle <= 180) {
-                                servo_set_angle(req_angle);
-                                printf(">> Servo moved to %d deg\n", req_angle);
-                            } else {
-                                printf(">> Error: Angle must be between 0 and 180 degrees.\n");
-                            }
-                        } else if (strncmp(p, "angle ", 6) == 0) {
-                            int req_angle = atoi(p + 6);
-                            if (req_angle >= 0 && req_angle <= 180) {
-                                servo_set_angle(req_angle);
-                                printf(">> Servo moved to %d deg\n", req_angle);
-                            } else {
-                                printf(">> Error: Angle must be between 0 and 180 degrees.\n");
-                            }
-                        } else if (strcmp(p, "bark") == 0 || strcmp(p, "play") == 0 || strcmp(p, "sound") == 0) {
-                            audio_play("dog_bark");
-                            printf(">> Playing dog bark on HT517 speaker (Volume: %d%%)\n", audio_get_volume());
-                        } else if (strcmp(p, "stop") == 0) {
-                            audio_stop();
-                            printf(">> Audio playback stopped.\n");
-                        } else if (strncmp(p, "vol ", 4) == 0 || strncmp(p, "volume ", 7) == 0) {
-                            int req_vol = (strncmp(p, "vol ", 4) == 0) ? atoi(p + 4) : atoi(p + 7);
-                            if (req_vol >= 0 && req_vol <= 100) {
-                                audio_set_volume(req_vol);
-                                printf(">> Speaker volume set to %d%%\n", req_vol);
-                            } else {
-                                printf(">> Error: Volume must be between 0 and 100.\n");
-                            }
-                        } else if (strcmp(p, "status") == 0) {
-                            printf(">> Current Servo Angle : %d deg\n", current_servo_angle);
-                            printf(">> Current Speaker Vol : %d%%\n", audio_get_volume());
-                            printf(">> Web Dashboard       : http://192.168.4.1/\n");
-                        } else if (strcmp(p, "help") == 0 || strcmp(p, "?") == 0) {
-                            printf("Available Commands:\n");
-                            printf("  0 - 180          : Direct servo angle\n");
-                            printf("  angle <N>        : Set servo angle\n");
-                            printf("  bark / play      : Play dog bark sound\n");
-                            printf("  stop             : Stop speaker playback\n");
-                            printf("  vol <0-100>      : Set volume percentage\n");
-                            printf("  status           : Show device status\n");
-                            printf("  reboot / restart : Restart ESP32-S3\n");
-                        } else if (strcmp(p, "reboot") == 0 || strcmp(p, "restart") == 0) {
-                            printf("Rebooting ESP32-S3...\n");
-                            vTaskDelay(pdMS_TO_TICKS(100));
-                            esp_restart();
-                        } else {
-                            printf(">> Unknown command: '%s'. Enter a number (0-180), 'bark', 'vol 80', or 'help'.\n", p);
-                        }
-
-                        cmd_idx = 0;
-                        printf("REPL> ");
-                        fflush(stdout);
-                    }
-                } else if (c == 0x08 || c == 0x7F) { // Backspace
-                    if (cmd_idx > 0) {
-                        cmd_idx--;
-                        printf("\b \b");
-                        fflush(stdout);
-                    }
-                } else if (c >= 0x20 && c <= 0x7E) {
-                    // Store printable ASCII characters and echo back
-                    if (cmd_idx < (int)sizeof(cmd_buf) - 1) {
-                        cmd_buf[cmd_idx++] = (char)c;
-                        putchar((char)c);
-                        fflush(stdout);
-                    }
-                }
-            }
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0, (struct sockaddr *)&client_addr, &addr_len);
+        if (len < (int)sizeof(dns_header_t)) {
+            continue;
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
+
+        dns_header_t *dns_hdr = (dns_header_t *)rx_buffer;
+        // Check if standard query (QR == 0)
+        if ((ntohs(dns_hdr->flags) & 0x8000) != 0) {
+            continue;
+        }
+
+        // Parse Question section to find end of QNAME
+        int qname_pos = sizeof(dns_header_t);
+        while (qname_pos < len && rx_buffer[qname_pos] != 0) {
+            qname_pos += rx_buffer[qname_pos] + 1;
+        }
+        qname_pos++; // skip terminating 0 byte
+        int qend_pos = qname_pos + 4; // skip QTYPE (2) + QCLASS (2)
+
+        if (qend_pos > len || qend_pos + 16 > (int)sizeof(rx_buffer)) {
+            continue;
+        }
+
+        // Formulate standard DNS Answer pointing to 192.168.4.1
+        dns_hdr->flags    = htons(0x8180); // Standard response, recursion available, no error
+        dns_hdr->qd_count = htons(1);
+        dns_hdr->an_count = htons(1);
+        dns_hdr->ns_count = 0;
+        dns_hdr->ar_count = 0;
+
+        uint8_t *ans = rx_buffer + qend_pos;
+        // Compression pointer to Question Name at offset 12 (0xC00C)
+        ans[0] = 0xC0;
+        ans[1] = 0x0C;
+        // TYPE: A (IPv4)
+        ans[2] = 0x00;
+        ans[3] = 0x01;
+        // CLASS: IN
+        ans[4] = 0x00;
+        ans[5] = 0x01;
+        // TTL: 60s
+        ans[6] = 0x00;
+        ans[7] = 0x00;
+        ans[8] = 0x00;
+        ans[9] = 0x3C;
+        // RDLENGTH: 4 bytes
+        ans[10] = 0x00;
+        ans[11] = 0x04;
+        // RDATA: 192.168.4.1
+        ans[12] = 192;
+        ans[13] = 168;
+        ans[14] = 4;
+        ans[15] = 1;
+
+        int resp_len = qend_pos + 16;
+        sendto(sock, rx_buffer, resp_len, 0, (struct sockaddr *)&client_addr, addr_len);
     }
 }
 
 // =========================================================================
-// HTML / WEB INTERFACE
+// SERIAL CONSOLE TASK (USB SERIAL/JTAG + UART0 BIDIRECTIONAL REPL)
+// =========================================================================
+static void console_print(const char *str) {
+    printf("%s", str);
+    fflush(stdout);
+    uart_write_bytes(UART_NUM_0, str, strlen(str));
+}
+
+static void console_read_task(void *pvParameter) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    // Initialize UART0 driver on GPIO 43/44 so secondary UART COM port also works
+    uart_config_t uart_cfg = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    uart_param_config(UART_NUM_0, &uart_cfg);
+    uart_driver_install(UART_NUM_0, 512, 512, 0, NULL, 0);
+
+    // Set standard input to non-blocking
+    int fd = fileno(stdin);
+    int flags = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    vTaskDelay(pdMS_TO_TICKS(400));
+
+    const char *banner =
+        "\n==================================================\n"
+        "   YD-ESP32-S3 Interactive Console Ready\n"
+        "==================================================\n"
+        "Servo Commands:\n"
+        "  0 - 180          : Move servo angle directly (e.g. '90')\n"
+        "  angle <N>        : Move servo angle (e.g. 'angle 45')\n"
+        "Speaker Audio Commands:\n"
+        "  bark / play      : Play dog bark sound on HT517\n"
+        "  beep / test      : Play diagnostic test beep on HT517\n"
+        "  stop             : Stop speaker playback\n"
+        "  vol <0-100>      : Set volume percentage (e.g. 'vol 85')\n"
+        "General Commands:\n"
+        "  status           : Show servo angle, volume & Wi-Fi IP\n"
+        "  reboot / restart : Restart ESP32-S3 board\n"
+        "  help             : Show command list\n"
+        "==================================================\n"
+        "REPL> ";
+    console_print(banner);
+
+    char cmd_buf[128];
+    int cmd_idx = 0;
+
+    while (1) {
+        uint8_t c = 0;
+        bool has_char = false;
+
+        // 1. Read from STDIN (USB Serial/JTAG primary console)
+        if (read(fd, &c, 1) > 0) {
+            has_char = true;
+        } else {
+            // 2. Read from UART0 (CH340/CH343 COM port)
+            if (uart_read_bytes(UART_NUM_0, &c, 1, 0) > 0) {
+                has_char = true;
+            }
+        }
+
+        if (has_char) {
+            // Handle Ctrl+C (Clear current line)
+            if (c == 0x03) {
+                console_print("\n[Line Cleared]\nREPL> ");
+                cmd_idx = 0;
+                continue;
+            }
+
+            // Handle Enter (Newline)
+            if (c == '\r' || c == '\n') {
+                if (cmd_idx > 0) {
+                    cmd_buf[cmd_idx] = '\0';
+                    console_print("\n");
+
+                    char *p = cmd_buf;
+                    while (*p == ' ' || *p == '\t') p++;
+
+                    bool is_numeric = true;
+                    int p_len = strlen(p);
+                    if (p_len == 0) is_numeric = false;
+                    for (int j = 0; j < p_len; j++) {
+                        if (!isdigit((unsigned char)p[j])) {
+                            is_numeric = false;
+                            break;
+                        }
+                    }
+
+                    if (is_numeric) {
+                        int req_angle = atoi(p);
+                        if (req_angle >= 0 && req_angle <= 180) {
+                            servo_set_angle(req_angle);
+                            char msg[64];
+                            snprintf(msg, sizeof(msg), ">> Servo moved to %d deg\n", req_angle);
+                            console_print(msg);
+                        } else {
+                            console_print(">> Error: Angle must be between 0 and 180 degrees.\n");
+                        }
+                    } else if (strncmp(p, "angle ", 6) == 0) {
+                        int req_angle = atoi(p + 6);
+                        if (req_angle >= 0 && req_angle <= 180) {
+                            servo_set_angle(req_angle);
+                            char msg[64];
+                            snprintf(msg, sizeof(msg), ">> Servo moved to %d deg\n", req_angle);
+                            console_print(msg);
+                        } else {
+                            console_print(">> Error: Angle must be between 0 and 180 degrees.\n");
+                        }
+                    } else if (strcmp(p, "bark") == 0 || strcmp(p, "play") == 0 || strcmp(p, "sound") == 0) {
+                        audio_play("dog_bark");
+                        char msg[64];
+                        snprintf(msg, sizeof(msg), ">> Playing dog bark on HT517 (Volume: %d%%)\n", audio_get_volume());
+                        console_print(msg);
+                    } else if (strcmp(p, "beep") == 0 || strcmp(p, "test") == 0) {
+                        audio_play_test_beep();
+                        console_print(">> Playing test beep chime on HT517 speaker...\n");
+                    } else if (strcmp(p, "stop") == 0) {
+                        audio_stop();
+                        console_print(">> Audio playback stopped.\n");
+                    } else if (strncmp(p, "vol ", 4) == 0 || strncmp(p, "volume ", 7) == 0) {
+                        int req_vol = (strncmp(p, "vol ", 4) == 0) ? atoi(p + 4) : atoi(p + 7);
+                        if (req_vol >= 0 && req_vol <= 100) {
+                            audio_set_volume(req_vol);
+                            char msg[64];
+                            snprintf(msg, sizeof(msg), ">> Speaker volume set to %d%%\n", req_vol);
+                            console_print(msg);
+                        } else {
+                            console_print(">> Error: Volume must be between 0 and 100.\n");
+                        }
+                    } else if (strcmp(p, "status") == 0) {
+                        char msg[128];
+                        snprintf(msg, sizeof(msg), ">> Servo: %d deg | Speaker Vol: %d%% | Web: http://192.168.4.1/\n",
+                                 current_servo_angle, audio_get_volume());
+                        console_print(msg);
+                    } else if (strcmp(p, "help") == 0 || strcmp(p, "?") == 0) {
+                        console_print("Available Commands:\n"
+                                      "  0 - 180          : Move servo angle\n"
+                                      "  bark / play      : Play dog bark sound\n"
+                                      "  beep / test      : Play diagnostic beep\n"
+                                      "  stop             : Stop speaker playback\n"
+                                      "  vol <0-100>      : Set volume\n"
+                                      "  status           : Show device status\n"
+                                      "  reboot / restart : Restart ESP32-S3\n");
+                    } else if (strcmp(p, "reboot") == 0 || strcmp(p, "restart") == 0) {
+                        console_print("Rebooting ESP32-S3...\n");
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                        esp_restart();
+                    } else {
+                        char msg[128];
+                        snprintf(msg, sizeof(msg), ">> Unknown command: '%s'. Enter a number (0-180), 'bark', 'beep', or 'help'.\n", p);
+                        console_print(msg);
+                    }
+
+                    cmd_idx = 0;
+                    console_print("REPL> ");
+                } else {
+                    console_print("REPL> ");
+                }
+            } else if (c == 0x08 || c == 0x7F) { // Backspace
+                if (cmd_idx > 0) {
+                    cmd_idx--;
+                    console_print("\b \b");
+                }
+            } else if (c >= 0x20 && c <= 0x7E) {
+                if (cmd_idx < (int)sizeof(cmd_buf) - 1) {
+                    cmd_buf[cmd_idx++] = (char)c;
+                    char echo_str[2] = {(char)c, '\0'};
+                    console_print(echo_str);
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// =========================================================================
+// HTML / WEB INTERFACE (RESPONSIVE FOR IPHONE CNA & DESKTOP BROWSERS)
 // =========================================================================
 static const char INDEX_HTML[] = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <title>YD-ESP32-S3 Controller</title>
     <style>
         :root {
@@ -254,72 +397,49 @@ static const char INDEX_HTML[] = R"rawliteral(
             --text-color: #f8fafc;
             --muted-text: #94a3b8;
         }
-        * {
-            box-sizing: border-box;
-        }
+        * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             background-color: var(--bg-color);
             color: var(--text-color);
-            margin: 0;
             display: flex;
             align-items: center;
             justify-content: center;
             min-height: 100vh;
-            padding: 20px 16px;
+            padding: 16px;
         }
         .container {
             background-color: var(--card-color);
             width: 100%;
-            max-width: 460px;
+            max-width: 440px;
             border-radius: 20px;
-            padding: 26px 24px;
-            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.6);
+            padding: 24px 20px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.6);
             border: 1px solid var(--card-border);
             text-align: center;
         }
-        h1 {
-            font-size: 1.45rem;
-            margin: 0 0 4px 0;
-            color: var(--primary);
-        }
-        .sub-header {
-            font-size: 0.8rem;
-            color: var(--muted-text);
-            margin-bottom: 20px;
-        }
+        h1 { font-size: 1.4rem; margin-bottom: 4px; color: var(--primary); }
+        .sub-header { font-size: 0.78rem; color: var(--muted-text); margin-bottom: 18px; }
         .section-box {
             background: #0f172a;
             border: 1px solid var(--card-border);
             border-radius: 14px;
             padding: 16px;
-            margin-bottom: 18px;
+            margin-bottom: 16px;
         }
         .section-title {
-            font-size: 0.8rem;
+            font-size: 0.75rem;
             font-weight: 700;
             letter-spacing: 0.08em;
             text-transform: uppercase;
             color: var(--muted-text);
-            margin-bottom: 12px;
+            margin-bottom: 10px;
             display: flex;
             justify-content: space-between;
-            align-items: center;
         }
-        .readout {
-            font-size: 3.2rem;
-            font-weight: 700;
-            color: var(--text-color);
-            font-variant-numeric: tabular-nums;
-            line-height: 1.1;
-        }
-        .readout-unit {
-            font-size: 1.4rem;
-            color: var(--primary);
-        }
-        .slider-wrap {
-            margin: 16px 0 8px 0;
-        }
+        .readout { font-size: 3rem; font-weight: 700; color: var(--text-color); line-height: 1.1; }
+        .readout-unit { font-size: 1.3rem; color: var(--primary); }
+        .slider-wrap { margin: 14px 0 8px 0; }
         input[type=range] {
             -webkit-appearance: none;
             width: 100%;
@@ -341,7 +461,7 @@ static const char INDEX_HTML[] = R"rawliteral(
         .range-labels {
             display: flex;
             justify-content: space-between;
-            font-size: 0.75rem;
+            font-size: 0.72rem;
             color: var(--muted-text);
             margin-top: 6px;
         }
@@ -349,13 +469,13 @@ static const char INDEX_HTML[] = R"rawliteral(
             display: grid;
             grid-template-columns: repeat(5, 1fr);
             gap: 6px;
-            margin-top: 14px;
+            margin-top: 12px;
         }
         .audio-btn-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 10px;
-            margin-top: 14px;
+            margin-top: 12px;
         }
         button {
             background: #334155;
@@ -368,29 +488,11 @@ static const char INDEX_HTML[] = R"rawliteral(
             cursor: pointer;
             transition: all 0.15s ease;
         }
-        button:hover {
-            background: var(--primary-hover);
-            color: #ffffff;
-        }
-        button:active {
-            transform: scale(0.96);
-        }
-        .btn-bark {
-            background: var(--accent);
-            padding: 14px 10px;
-            font-size: 0.95rem;
-        }
-        .btn-bark:hover {
-            background: var(--accent-hover);
-        }
-        .btn-stop {
-            background: #475569;
-            padding: 14px 10px;
-            font-size: 0.95rem;
-        }
-        .btn-stop:hover {
-            background: var(--danger-hover);
-        }
+        button:active { transform: scale(0.96); }
+        .btn-bark { background: var(--accent); padding: 13px 8px; font-size: 0.92rem; }
+        .btn-beep { background: #0284c7; padding: 13px 8px; font-size: 0.92rem; }
+        .btn-stop { background: #475569; padding: 13px 8px; font-size: 0.92rem; grid-column: span 2; }
+        .btn-stop:active { background: var(--danger-hover); }
         .status-dot {
             display: inline-block;
             width: 8px;
@@ -399,17 +501,13 @@ static const char INDEX_HTML[] = R"rawliteral(
             border-radius: 50%;
             margin-right: 6px;
         }
-        .status-bar {
-            margin-top: 14px;
-            font-size: 0.8rem;
-            color: var(--muted-text);
-        }
+        .status-bar { margin-top: 12px; font-size: 0.78rem; color: var(--muted-text); }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>YD-ESP32-S3 Dashboard</h1>
-        <div class="sub-header">Servo (GPIO 4) &amp; HT517 I2S Speaker (GPIO 10,11,12)</div>
+        <div class="sub-header">Servo (GPIO 4) &amp; HT517 Speaker (GPIO 10,11,12)</div>
 
         <!-- SERVO MOTOR CONTROL SECTION -->
         <div class="section-box">
@@ -420,18 +518,12 @@ static const char INDEX_HTML[] = R"rawliteral(
             <div>
                 <span class="readout" id="angleVal">90</span><span class="readout-unit">&deg;</span>
             </div>
-
             <div class="slider-wrap">
                 <input type="range" id="angleSlider" min="0" max="180" value="90" oninput="onAngleSliderMove(this.value)" onchange="sendAngle(this.value)">
                 <div class="range-labels">
-                    <span>0&deg;</span>
-                    <span>45&deg;</span>
-                    <span>90&deg;</span>
-                    <span>135&deg;</span>
-                    <span>180&deg;</span>
+                    <span>0&deg;</span><span>45&deg;</span><span>90&deg;</span><span>135&deg;</span><span>180&deg;</span>
                 </div>
             </div>
-
             <div class="btn-grid">
                 <button onclick="setAngle(0)">0&deg;</button>
                 <button onclick="setAngle(45)">45&deg;</button>
@@ -441,45 +533,33 @@ static const char INDEX_HTML[] = R"rawliteral(
             </div>
         </div>
 
-        <!-- HT517 I2S SPEAKER AUDIO CONTROL SECTION -->
+        <!-- HT517 SPEAKER CONTROL SECTION -->
         <div class="section-box">
             <div class="section-title">
-                <span>Speaker Audio</span>
-                <span style="color: var(--accent);">HT517 Amp</span>
+                <span>HT517 Speaker Audio</span>
+                <span style="color: var(--accent);" id="volLabel">Vol: 80%</span>
             </div>
-
-            <div style="margin-bottom: 8px;">
-                <span style="font-size: 1.1rem; font-weight: 600; color: var(--muted-text);">Volume: </span>
-                <span style="font-size: 1.4rem; font-weight: 700; color: var(--text-color);" id="volVal">80</span>
-                <span style="font-size: 1.1rem; color: var(--primary);">%</span>
-            </div>
-
             <div class="slider-wrap">
                 <input type="range" id="volSlider" min="0" max="100" value="80" oninput="onVolSliderMove(this.value)" onchange="sendVolume(this.value)">
                 <div class="range-labels">
-                    <span>Mute</span>
-                    <span>25%</span>
-                    <span>50%</span>
-                    <span>75%</span>
-                    <span>100%</span>
+                    <span>Mute</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
                 </div>
             </div>
-
             <div class="audio-btn-grid">
-                <button class="btn-bark" onclick="playBark()">&#128054; Play Bark</button>
+                <button class="btn-bark" onclick="playBark()">&#128054; Dog Bark</button>
+                <button class="btn-beep" onclick="playBeep()">&#128276; Test Tone</button>
                 <button class="btn-stop" onclick="stopAudio()">&#9209; Stop Audio</button>
             </div>
         </div>
 
         <div class="status-bar">
-            <span class="status-dot"></span><span id="connStatus">System Ready</span>
+            <span class="status-dot"></span><span id="connStatus">Portal Connected (192.168.4.1)</span>
         </div>
     </div>
 
     <script>
         let pendingAngle = null;
         let isAngleThrottled = false;
-
         let pendingVol = null;
         let isVolThrottled = false;
 
@@ -511,24 +591,20 @@ static const char INDEX_HTML[] = R"rawliteral(
         }
 
         function sendAngle(val) {
-            document.getElementById("connStatus").innerText = "Updating servo...";
-            fetch(`/set?angle=${val}`)
-                .then(res => res.text())
-                .then(text => {
-                    document.getElementById("connStatus").innerText = "Servo Angle: " + val + "°";
-                })
-                .catch(err => {
-                    document.getElementById("connStatus").innerText = "Servo communication error";
-                });
+            document.getElementById("connStatus").innerText = "Setting angle: " + val + "°";
+            fetch('/set?angle=' + val)
+                .then(r => r.text())
+                .then(t => { document.getElementById("connStatus").innerText = "Servo Angle: " + val + "°"; })
+                .catch(e => { document.getElementById("connStatus").innerText = "Servo command error"; });
         }
 
         function updateVolDisplay(val) {
-            document.getElementById("volVal").innerText = val;
+            document.getElementById("volLabel").innerText = "Vol: " + val + "%";
             document.getElementById("volSlider").value = val;
         }
 
         function onVolSliderMove(val) {
-            document.getElementById("volVal").innerText = val;
+            document.getElementById("volLabel").innerText = "Vol: " + val + "%";
             if (!isVolThrottled) {
                 sendVolume(val);
                 isVolThrottled = true;
@@ -545,55 +621,44 @@ static const char INDEX_HTML[] = R"rawliteral(
         }
 
         function sendVolume(val) {
-            document.getElementById("connStatus").innerText = "Setting volume...";
-            fetch(`/volume?val=${val}`)
-                .then(res => res.text())
-                .then(text => {
-                    document.getElementById("connStatus").innerText = "Volume: " + val + "%";
-                })
-                .catch(err => {
-                    document.getElementById("connStatus").innerText = "Volume error";
-                });
+            fetch('/volume?val=' + val)
+                .then(r => r.text())
+                .then(t => { document.getElementById("connStatus").innerText = "Speaker Volume: " + val + "%"; })
+                .catch(e => { document.getElementById("connStatus").innerText = "Volume error"; });
         }
 
         function playBark() {
-            document.getElementById("connStatus").innerText = "Playing dog bark...";
+            document.getElementById("connStatus").innerText = "Playing dog bark audio...";
             fetch('/play?sound=dog_bark')
-                .then(res => res.text())
-                .then(text => {
-                    document.getElementById("connStatus").innerText = "Playing dog bark audio";
-                })
-                .catch(err => {
-                    document.getElementById("connStatus").innerText = "Audio playback request failed";
-                });
+                .then(r => r.text())
+                .then(t => { document.getElementById("connStatus").innerText = "Dog bark playing on HT517"; })
+                .catch(e => { document.getElementById("connStatus").innerText = "Play command error"; });
+        }
+
+        function playBeep() {
+            document.getElementById("connStatus").innerText = "Playing diagnostic test tone...";
+            fetch('/beep')
+                .then(r => r.text())
+                .then(t => { document.getElementById("connStatus").innerText = "Test tone playing on HT517"; })
+                .catch(e => { document.getElementById("connStatus").innerText = "Beep command error"; });
         }
 
         function stopAudio() {
-            document.getElementById("connStatus").innerText = "Stopping audio...";
+            document.getElementById("connStatus").innerText = "Stopping speaker audio...";
             fetch('/stop')
-                .then(res => res.text())
-                .then(text => {
-                    document.getElementById("connStatus").innerText = "Audio stopped";
-                })
-                .catch(err => {
-                    document.getElementById("connStatus").innerText = "Stop command failed";
-                });
+                .then(r => r.text())
+                .then(t => { document.getElementById("connStatus").innerText = "Speaker playback stopped"; })
+                .catch(e => { document.getElementById("connStatus").innerText = "Stop command error"; });
         }
 
         window.onload = function() {
             fetch('/get')
-                .then(res => res.json())
+                .then(r => r.json())
                 .then(data => {
-                    if (data.angle !== undefined) {
-                        updateAngleDisplay(data.angle);
-                    }
-                    if (data.volume !== undefined) {
-                        updateVolDisplay(data.volume);
-                    }
+                    if (data.angle !== undefined) updateAngleDisplay(data.angle);
+                    if (data.volume !== undefined) updateVolDisplay(data.volume);
                 })
-                .catch(err => {
-                    console.log("Failed to load initial status", err);
-                });
+                .catch(err => { console.log("Init status error", err); });
         };
     </script>
 </body>
@@ -601,11 +666,28 @@ static const char INDEX_HTML[] = R"rawliteral(
 )rawliteral";
 
 // =========================================================================
-// HTTP SERVER HANDLERS
+// HTTP SERVER HANDLERS & CAPTIVE REDIRECTORS
 // =========================================================================
 static esp_err_t root_get_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Intercepts Apple CNA & Android probes and sends HTTP 302 Found to trigger auto-open
+static esp_err_t captive_redirect_handler(httpd_req_t *req) {
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t http_404_error_handler(httpd_req_t *req, httpd_err_code_t err) {
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_send(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -624,7 +706,6 @@ static esp_err_t set_angle_handler(httpd_req_t *req) {
             return ESP_OK;
         }
     }
-
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing 'angle' query param");
     return ESP_FAIL;
 }
@@ -654,6 +735,13 @@ static esp_err_t play_sound_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t play_beep_handler(httpd_req_t *req) {
+    audio_play_test_beep();
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, "BEEPING", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 static esp_err_t stop_sound_handler(httpd_req_t *req) {
     audio_stop();
     httpd_resp_set_type(req, "text/plain");
@@ -668,18 +756,15 @@ static esp_err_t set_volume_handler(httpd_req_t *req) {
         if (httpd_query_key_value(query, "val", param, sizeof(param)) == ESP_OK ||
             httpd_query_key_value(query, "volume", param, sizeof(param)) == ESP_OK) {
             int vol = atoi(param);
-            if (vol < 0) vol = 0;
-            if (vol > 100) vol = 100;
             audio_set_volume(vol);
 
             char resp[32];
-            snprintf(resp, sizeof(resp), "OK %d", vol);
+            snprintf(resp, sizeof(resp), "OK %d", audio_get_volume());
             httpd_resp_set_type(req, "text/plain");
             httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
             return ESP_OK;
         }
     }
-
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing 'val' query param");
     return ESP_FAIL;
 }
@@ -687,53 +772,59 @@ static esp_err_t set_volume_handler(httpd_req_t *req) {
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 10;
+    config.max_uri_handlers = 20; // Support app routes + captive portal routes
     config.lru_purge_enable = true;
 
     if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t uri_root = {};
-        uri_root.uri      = "/";
-        uri_root.method   = HTTP_GET;
-        uri_root.handler  = root_get_handler;
-        uri_root.user_ctx = NULL;
+        // Core application endpoints
+        httpd_uri_t uri_root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
         httpd_register_uri_handler(server, &uri_root);
 
-        httpd_uri_t uri_set = {};
-        uri_set.uri      = "/set";
-        uri_set.method   = HTTP_GET;
-        uri_set.handler  = set_angle_handler;
-        uri_set.user_ctx = NULL;
+        httpd_uri_t uri_set = { .uri = "/set", .method = HTTP_GET, .handler = set_angle_handler, .user_ctx = NULL };
         httpd_register_uri_handler(server, &uri_set);
 
-        httpd_uri_t uri_get = {};
-        uri_get.uri      = "/get";
-        uri_get.method   = HTTP_GET;
-        uri_get.handler  = get_status_handler;
-        uri_get.user_ctx = NULL;
+        httpd_uri_t uri_get = { .uri = "/get", .method = HTTP_GET, .handler = get_status_handler, .user_ctx = NULL };
         httpd_register_uri_handler(server, &uri_get);
 
-        httpd_uri_t uri_play = {};
-        uri_play.uri      = "/play";
-        uri_play.method   = HTTP_GET;
-        uri_play.handler  = play_sound_handler;
-        uri_play.user_ctx = NULL;
+        httpd_uri_t uri_play = { .uri = "/play", .method = HTTP_GET, .handler = play_sound_handler, .user_ctx = NULL };
         httpd_register_uri_handler(server, &uri_play);
 
-        httpd_uri_t uri_stop = {};
-        uri_stop.uri      = "/stop";
-        uri_stop.method   = HTTP_GET;
-        uri_stop.handler  = stop_sound_handler;
-        uri_stop.user_ctx = NULL;
+        httpd_uri_t uri_beep = { .uri = "/beep", .method = HTTP_GET, .handler = play_beep_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server, &uri_beep);
+
+        httpd_uri_t uri_stop = { .uri = "/stop", .method = HTTP_GET, .handler = stop_sound_handler, .user_ctx = NULL };
         httpd_register_uri_handler(server, &uri_stop);
 
-        httpd_uri_t uri_volume = {};
-        uri_volume.uri      = "/volume";
-        uri_volume.method   = HTTP_GET;
-        uri_volume.handler  = set_volume_handler;
-        uri_volume.user_ctx = NULL;
-        httpd_register_uri_handler(server, &uri_volume);
+        httpd_uri_t uri_vol = { .uri = "/volume", .method = HTTP_GET, .handler = set_volume_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server, &uri_vol);
 
-        ESP_LOGI(TAG, "HTTP Server active on port %d", config.server_port);
+        // Apple iOS Captive Network Assistant detection endpoints
+        httpd_uri_t uri_apple1 = { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server, &uri_apple1);
+
+        httpd_uri_t uri_apple2 = { .uri = "/canonical.html", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server, &uri_apple2);
+
+        httpd_uri_t uri_apple3 = { .uri = "/library/test/success.html", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server, &uri_apple3);
+
+        // Android / Windows / Chrome captive endpoints
+        httpd_uri_t uri_and1 = { .uri = "/generate_204", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server, &uri_and1);
+
+        httpd_uri_t uri_and2 = { .uri = "/gen_204", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server, &uri_and2);
+
+        httpd_uri_t uri_win1 = { .uri = "/ncsi.txt", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server, &uri_win1);
+
+        httpd_uri_t uri_win2 = { .uri = "/connecttest.txt", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server, &uri_win2);
+
+        // Catch-all 404 handler redirecting all external domain requests to http://192.168.4.1/
+        httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, http_404_error_handler);
+
+        ESP_LOGI(TAG, "HTTP Server active on port 80 with Captive Portal redirection");
     } else {
         ESP_LOGE(TAG, "Failed to start HTTP server!");
     }
@@ -757,14 +848,18 @@ static void wifi_init_softap(void) {
     wifi_config.ap.channel = 1;
     wifi_config.ap.max_connection = 4;
     wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    wifi_config.ap.beacon_interval = 100;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    // Disable Wi-Fi power save to prevent iPhone disconnections or packet latency
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
     ESP_LOGI(TAG, "==================================================");
-    ESP_LOGI(TAG, "Wi-Fi AP started. SSID: ESP32S3-Servo");
-    ESP_LOGI(TAG, "Connect to Wi-Fi and open http://192.168.4.1");
+    ESP_LOGI(TAG, "Wi-Fi AP active. SSID: 'ESP32S3-Servo'");
+    ESP_LOGI(TAG, "Web Portal: http://192.168.4.1/");
     ESP_LOGI(TAG, "==================================================");
 }
 
@@ -779,18 +874,21 @@ extern "C" void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // 1. Initialize Wi-Fi stack & TCP/IP FIRST so lwIP sockets are ready
+    // 1. Initialize Wi-Fi stack & TCP/IP
     wifi_init_softap();
 
-    // 2. Initialize hardware PWM on GPIO 4 for servo control
+    // 2. Start Captive DNS Server (UDP port 53)
+    xTaskCreatePinnedToCore(dns_server_task, "dns_server_task", 4096, NULL, 5, NULL, 0);
+
+    // 3. Initialize hardware PWM on GPIO 4 for servo control
     servo_init();
 
-    // 3. Initialize HT517 I2S audio driver & background tasks
+    // 4. Initialize HT517 I2S audio driver & background tasks
     audio_player_init();
 
-    // 4. Start web server
+    // 5. Start HTTP web server with Captive Portal routes
     start_webserver();
 
-    // 5. Start serial input task for interactive REPL control
+    // 6. Start bidirectional console task (USB Serial/JTAG + UART0)
     xTaskCreate(console_read_task, "console_read_task", 4096, NULL, 5, NULL);
 }
