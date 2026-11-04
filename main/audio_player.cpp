@@ -27,7 +27,7 @@ static int32_t current_din_pin  = 12;
 
 static i2s_chan_handle_t tx_chan = NULL;
 static i2s_chan_handle_t rx_chan = NULL;
-static bool tx_chan_enabled = false; // State tracker to prevent duplicate disable calls
+static bool tx_chan_enabled = false;
 static int32_t current_volume = 80;
 static QueueHandle_t audio_queue;
 static volatile bool audio_stop_requested = false;
@@ -374,8 +374,8 @@ void audio_set_pins(int bclk, int lrc, int din) {
         tx_chan = NULL;
     }
 
-    // Allocate Controller 0 exclusively for Speaker TX
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    // Standard I2S on Controller 1 (frees I2S0 for PDM microphone)
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_chan, NULL));
 
     i2s_std_config_t std_cfg = {
@@ -408,8 +408,8 @@ void audio_player_init(void) {
     load_audio_nvs();
     audio_queue = xQueueCreate(5, sizeof(char) * 32);
 
-    // Dedicated Controller 0 for Speaker TX
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    // Controller 1 dedicated for Speaker TX (Standard I2S)
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_chan, NULL));
 
     i2s_std_config_t std_cfg = {
@@ -430,8 +430,8 @@ void audio_player_init(void) {
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &std_cfg));
     tx_chan_enabled = false;
 
-    // Dedicated Controller 1 for Microphone RX (prevents collision warning)
-    i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+    // Controller 0 dedicated for Microphone RX (Hardware PDM is only supported on I2S0)
+    i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     if (i2s_new_channel(&rx_chan_cfg, NULL, &rx_chan) == ESP_OK) {
         i2s_pdm_rx_config_t pdm_rx_cfg = {
             .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(16000),
@@ -456,7 +456,7 @@ void audio_player_init(void) {
     xTaskCreatePinnedToCore(audio_task, "audio_task", 4096, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(audio_stream_task, "audio_stream_task", 4096, NULL, 3, NULL, 1);
 
-    ESP_LOGI(TAG, "Audio Driver Initialized (BCLK=%d, LRC=%d, DIN=%d)",
+    ESP_LOGI(TAG, "Audio Driver Initialized (Speaker on I2S1 BCLK=%d, LRC=%d, DIN=%d | PDM Mic on I2S0)",
              (int)current_bclk_pin, (int)current_lrc_pin, (int)current_din_pin);
 }
 
