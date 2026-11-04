@@ -202,14 +202,14 @@ static void console_read_task(void *pvParameter) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
     // Initialize UART0 driver on GPIO 43/44 so secondary UART COM port also works
-    uart_config_t uart_cfg = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
+    uart_config_t uart_cfg = {};
+    uart_cfg.baud_rate = 115200;
+    uart_cfg.data_bits = UART_DATA_8_BITS;
+    uart_cfg.parity    = UART_PARITY_DISABLE;
+    uart_cfg.stop_bits = UART_STOP_BITS_1;
+    uart_cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+    uart_cfg.source_clk = UART_SCLK_DEFAULT;
+
     uart_param_config(UART_NUM_0, &uart_cfg);
     uart_driver_install(UART_NUM_0, 512, 512, 0, NULL, 0);
 
@@ -344,9 +344,9 @@ static void console_read_task(void *pvParameter) {
                         vTaskDelay(pdMS_TO_TICKS(100));
                         esp_restart();
                     } else {
-                        char msg[128];
-                        snprintf(msg, sizeof(msg), ">> Unknown command: '%s'. Enter a number (0-180), 'bark', 'beep', or 'help'.\n", p);
-                        console_print(msg);
+                        console_print(">> Unknown command: '");
+                        console_print(p);
+                        console_print("'. Enter a number (0-180), 'bark', 'beep', or 'help'.\n");
                     }
 
                     cmd_idx = 0;
@@ -776,50 +776,77 @@ static void start_webserver(void) {
     config.lru_purge_enable = true;
 
     if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t uri = {};
+
         // Core application endpoints
-        httpd_uri_t uri_root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_root);
+        uri.uri = "/";
+        uri.method = HTTP_GET;
+        uri.handler = root_get_handler;
+        uri.user_ctx = NULL;
+        httpd_register_uri_handler(server, &uri);
 
-        httpd_uri_t uri_set = { .uri = "/set", .method = HTTP_GET, .handler = set_angle_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_set);
+        uri.uri = "/set";
+        uri.method = HTTP_GET;
+        uri.handler = set_angle_handler;
+        uri.user_ctx = NULL;
+        httpd_register_uri_handler(server, &uri);
 
-        httpd_uri_t uri_get = { .uri = "/get", .method = HTTP_GET, .handler = get_status_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_get);
+        uri.uri = "/get";
+        uri.method = HTTP_GET;
+        uri.handler = get_status_handler;
+        uri.user_ctx = NULL;
+        httpd_register_uri_handler(server, &uri);
 
-        httpd_uri_t uri_play = { .uri = "/play", .method = HTTP_GET, .handler = play_sound_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_play);
+        uri.uri = "/play";
+        uri.method = HTTP_GET;
+        uri.handler = play_sound_handler;
+        uri.user_ctx = NULL;
+        httpd_register_uri_handler(server, &uri);
 
-        httpd_uri_t uri_beep = { .uri = "/beep", .method = HTTP_GET, .handler = play_beep_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_beep);
+        uri.uri = "/beep";
+        uri.method = HTTP_GET;
+        uri.handler = play_beep_handler;
+        uri.user_ctx = NULL;
+        httpd_register_uri_handler(server, &uri);
 
-        httpd_uri_t uri_stop = { .uri = "/stop", .method = HTTP_GET, .handler = stop_sound_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_stop);
+        uri.uri = "/stop";
+        uri.method = HTTP_GET;
+        uri.handler = stop_sound_handler;
+        uri.user_ctx = NULL;
+        httpd_register_uri_handler(server, &uri);
 
-        httpd_uri_t uri_vol = { .uri = "/volume", .method = HTTP_GET, .handler = set_volume_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_vol);
+        uri.uri = "/volume";
+        uri.method = HTTP_GET;
+        uri.handler = set_volume_handler;
+        uri.user_ctx = NULL;
+        httpd_register_uri_handler(server, &uri);
 
         // Apple iOS Captive Network Assistant detection endpoints
-        httpd_uri_t uri_apple1 = { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_apple1);
+        uri.method = HTTP_GET;
+        uri.handler = captive_redirect_handler;
+        uri.user_ctx = NULL;
 
-        httpd_uri_t uri_apple2 = { .uri = "/canonical.html", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_apple2);
+        uri.uri = "/hotspot-detect.html";
+        httpd_register_uri_handler(server, &uri);
 
-        httpd_uri_t uri_apple3 = { .uri = "/library/test/success.html", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_apple3);
+        uri.uri = "/canonical.html";
+        httpd_register_uri_handler(server, &uri);
+
+        uri.uri = "/library/test/success.html";
+        httpd_register_uri_handler(server, &uri);
 
         // Android / Windows / Chrome captive endpoints
-        httpd_uri_t uri_and1 = { .uri = "/generate_204", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_and1);
+        uri.uri = "/generate_204";
+        httpd_register_uri_handler(server, &uri);
 
-        httpd_uri_t uri_and2 = { .uri = "/gen_204", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_and2);
+        uri.uri = "/gen_204";
+        httpd_register_uri_handler(server, &uri);
 
-        httpd_uri_t uri_win1 = { .uri = "/ncsi.txt", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_win1);
+        uri.uri = "/ncsi.txt";
+        httpd_register_uri_handler(server, &uri);
 
-        httpd_uri_t uri_win2 = { .uri = "/connecttest.txt", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_win2);
+        uri.uri = "/connecttest.txt";
+        httpd_register_uri_handler(server, &uri);
 
         // Catch-all 404 handler redirecting all external domain requests to http://192.168.4.1/
         httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, http_404_error_handler);
