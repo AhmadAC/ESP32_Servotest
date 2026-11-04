@@ -17,9 +17,9 @@
 static const char *TAG = "AUDIO";
 
 // Configurable hardware pin mappings (Default: YD-ESP32-S3 GPIO 10, 11, 12)
-static int current_bclk_pin = 10;
-static int current_lrc_pin  = 11;
-static int current_din_pin  = 12;
+static int32_t current_bclk_pin = 10;
+static int32_t current_lrc_pin  = 11;
+static int32_t current_din_pin  = 12;
 
 // Pinout mapping for optional external PDM microphone
 #define I2S_MIC_CLK_PIN GPIO_NUM_42
@@ -63,7 +63,7 @@ static void silence_and_disable_speaker(void) {
 static void play_synth_beep(void) {
     if (tx_chan == NULL) return;
     ESP_LOGI(TAG, "Playing diagnostic test chime on BCLK:%d, LRC:%d, DIN:%d...",
-             current_bclk_pin, current_lrc_pin, current_din_pin);
+             (int)current_bclk_pin, (int)current_lrc_pin, (int)current_din_pin);
 
     uint32_t sample_rate = 22050;
     i2s_channel_disable(tx_chan);
@@ -292,8 +292,8 @@ static void audio_task(void *pvParameter) {
             }
 
             ESP_LOGI(TAG, "Playing WAV on BCLK:%d, LRC:%d, DIN:%d (%lu Hz, %u ch, %u bits, %lu bytes)",
-                     current_bclk_pin, current_lrc_pin, current_din_pin,
-                     (unsigned long)sample_rate, channels, bit_depth, (unsigned long)data_size);
+                     (int)current_bclk_pin, (int)current_lrc_pin, (int)current_din_pin,
+                     (unsigned long)sample_rate, (unsigned int)channels, (unsigned int)bit_depth, (unsigned long)data_size);
 
             i2s_channel_disable(tx_chan);
 
@@ -339,9 +339,9 @@ static void audio_task(void *pvParameter) {
 }
 
 void audio_set_pins(int bclk, int lrc, int din) {
-    current_bclk_pin = bclk;
-    current_lrc_pin  = lrc;
-    current_din_pin  = din;
+    current_bclk_pin = (int32_t)bclk;
+    current_lrc_pin  = (int32_t)lrc;
+    current_din_pin  = (int32_t)din;
 
     nvs_handle_t my_handle;
     if (nvs_open("storage", NVS_READWRITE, &my_handle) == ESP_OK) {
@@ -378,13 +378,13 @@ void audio_set_pins(int bclk, int lrc, int din) {
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &std_cfg));
     i2s_channel_disable(tx_chan);
 
-    ESP_LOGI(TAG, "Audio pins updated: BCLK=%d, LRC=%d, DIN=%d", bclk, lrc, din);
+    ESP_LOGI(TAG, "Audio pins updated: BCLK=%d, LRC=%d, DIN=%d", (int)bclk, (int)lrc, (int)din);
 }
 
 void audio_get_pins(int *bclk, int *lrc, int *din) {
-    if (bclk) *bclk = current_bclk_pin;
-    if (lrc)  *lrc  = current_lrc_pin;
-    if (din)  *din  = current_din_pin;
+    if (bclk) *bclk = (int)current_bclk_pin;
+    if (lrc)  *lrc  = (int)current_lrc_pin;
+    if (din)  *din  = (int)current_din_pin;
 }
 
 void audio_player_init(void) {
@@ -439,7 +439,7 @@ void audio_player_init(void) {
     xTaskCreatePinnedToCore(audio_stream_task, "audio_stream_task", 4096, NULL, 3, NULL, 1);
 
     ESP_LOGI(TAG, "Audio Driver Initialized (BCLK=%d, LRC=%d, DIN=%d)",
-             current_bclk_pin, current_lrc_pin, current_din_pin);
+             (int)current_bclk_pin, (int)current_lrc_pin, (int)current_din_pin);
 }
 
 void audio_set_volume(int volume_pct) {
