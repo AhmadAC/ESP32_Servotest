@@ -27,6 +27,7 @@ static int32_t current_din_pin  = 12;
 
 static i2s_chan_handle_t tx_chan = NULL;
 static i2s_chan_handle_t rx_chan = NULL;
+static bool tx_chan_enabled = false; // State tracker to prevent duplicate disable calls
 static int32_t current_volume = 80;
 static QueueHandle_t audio_queue;
 static volatile bool audio_stop_requested = false;
@@ -52,12 +53,15 @@ static void load_audio_nvs(void) {
 
 static void silence_and_disable_speaker(void) {
     if (tx_chan == NULL) return;
-    int16_t silence_buf[256] = {0};
-    size_t bytes_written = 0;
-    for (int i = 0; i < 4; i++) {
-        i2s_channel_write(tx_chan, silence_buf, sizeof(silence_buf), &bytes_written, pdMS_TO_TICKS(10));
+    if (tx_chan_enabled) {
+        int16_t silence_buf[256] = {0};
+        size_t bytes_written = 0;
+        for (int i = 0; i < 4; i++) {
+            i2s_channel_write(tx_chan, silence_buf, sizeof(silence_buf), &bytes_written, pdMS_TO_TICKS(10));
+        }
+        i2s_channel_disable(tx_chan);
+        tx_chan_enabled = false;
     }
-    i2s_channel_disable(tx_chan);
 }
 
 static void play_synth_beep(void) {
@@ -66,7 +70,11 @@ static void play_synth_beep(void) {
              (int)current_bclk_pin, (int)current_lrc_pin, (int)current_din_pin);
 
     uint32_t sample_rate = 22050;
-    i2s_channel_disable(tx_chan);
+
+    if (tx_chan_enabled) {
+        i2s_channel_disable(tx_chan);
+        tx_chan_enabled = false;
+    }
 
     i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
     i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg);
@@ -75,6 +83,7 @@ static void play_synth_beep(void) {
     i2s_channel_reconfig_std_slot(tx_chan, &slot_cfg);
 
     i2s_channel_enable(tx_chan);
+    tx_chan_enabled = true;
 
     float vol = ((float)current_volume / 100.0f) * 0.80f;
     const size_t CHUNK = 256;
@@ -295,7 +304,10 @@ static void audio_task(void *pvParameter) {
                      (int)current_bclk_pin, (int)current_lrc_pin, (int)current_din_pin,
                      (unsigned long)sample_rate, (unsigned int)channels, (unsigned int)bit_depth, (unsigned long)data_size);
 
-            i2s_channel_disable(tx_chan);
+            if (tx_chan_enabled) {
+                i2s_channel_disable(tx_chan);
+                tx_chan_enabled = false;
+            }
 
             i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
             i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg);
@@ -307,6 +319,7 @@ static void audio_task(void *pvParameter) {
             i2s_channel_reconfig_std_slot(tx_chan, &slot_cfg);
 
             i2s_channel_enable(tx_chan);
+            tx_chan_enabled = true;
 
             const float HARDWARE_POWER_LIMIT = 0.80f;
             float vol_mult = ((float)current_volume / 100.0f) * HARDWARE_POWER_LIMIT;
@@ -353,12 +366,16 @@ void audio_set_pins(int bclk, int lrc, int din) {
     }
 
     if (tx_chan != NULL) {
-        i2s_channel_disable(tx_chan);
+        if (tx_chan_enabled) {
+            i2s_channel_disable(tx_chan);
+            tx_chan_enabled = false;
+        }
         i2s_del_channel(tx_chan);
         tx_chan = NULL;
     }
 
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    // Allocate Controller 0 exclusively for Speaker TX
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_chan, NULL));
 
     i2s_std_config_t std_cfg = {
@@ -376,7 +393,7 @@ void audio_set_pins(int bclk, int lrc, int din) {
         },
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &std_cfg));
-    i2s_channel_disable(tx_chan);
+    tx_chan_enabled = false;
 
     ESP_LOGI(TAG, "Audio pins updated: BCLK=%d, LRC=%d, DIN=%d", (int)bclk, (int)lrc, (int)din);
 }
@@ -391,7 +408,8 @@ void audio_player_init(void) {
     load_audio_nvs();
     audio_queue = xQueueCreate(5, sizeof(char) * 32);
 
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    // Dedicated Controller 0 for Speaker TX
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_chan, NULL));
 
     i2s_std_config_t std_cfg = {
@@ -410,10 +428,10 @@ void audio_player_init(void) {
     };
 
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &std_cfg));
-    i2s_channel_disable(tx_chan);
+    tx_chan_enabled = false;
 
-    // Optional PDM RX channel for microphone on Controller 1
-    i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    // Dedicated Controller 1 for Microphone RX (prevents collision warning)
+    i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
     if (i2s_new_channel(&rx_chan_cfg, NULL, &rx_chan) == ESP_OK) {
         i2s_pdm_rx_config_t pdm_rx_cfg = {
             .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(16000),
