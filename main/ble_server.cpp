@@ -13,17 +13,14 @@ static const char *TAG = "BLE_SERVER";
 static const char *DEVICE_NAME = "ESP32S3-Servo";
 
 // Nordic UART Service (NUS) UUIDs in little-endian format
-// Service: 6e400001-b5a3-f393-e0a9-e50e24dcca9e
 static const ble_uuid128_t gatt_svr_svc_uart_uuid =
     BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
                      0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e);
 
-// RX Characteristic (Phone writes to ESP32): 6e400002-b5a3-f393-e0a9-e50e24dcca9e
 static const ble_uuid128_t gatt_svr_chr_rx_uuid =
     BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
                      0x93, 0xf3, 0xa3, 0xb5, 0x02, 0x00, 0x40, 0x6e);
 
-// TX Characteristic (ESP32 notifies Phone): 6e400003-b5a3-f393-e0a9-e50e24dcca9e
 static const ble_uuid128_t gatt_svr_chr_tx_uuid =
     BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
                      0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e);
@@ -98,7 +95,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                  event->connect.status);
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
-            ble_server_send_notify(">> Connected to ESP32S3-Servo\n");
+            // CRITICAL FIX: Do NOT send notifications here before iOS has discovered services!
         } else {
             ble_advertise();
         }
@@ -116,6 +113,10 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
 
     case BLE_GAP_EVENT_SUBSCRIBE:
         ESP_LOGI(TAG, "BLE Subscribe event: cur_notify=%d", event->subscribe.cur_notify);
+        // Only notify after iOS has confirmed characteristic subscription
+        if (event->subscribe.cur_notify == 1) {
+            ble_server_send_notify(">> Connected to ESP32S3-Servo\n");
+        }
         return 0;
 
     default:
@@ -129,7 +130,6 @@ static void ble_advertise(void) {
     struct ble_hs_adv_fields rsp_fields;
     int rc;
 
-    // 1. Primary advertisement packet: Flags and Device Name
     memset(&fields, 0, sizeof(fields));
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     fields.name = (uint8_t *)DEVICE_NAME;
@@ -142,7 +142,6 @@ static void ble_advertise(void) {
         return;
     }
 
-    // 2. Scan response packet: Nordic UART 128-bit Service UUID
     memset(&rsp_fields, 0, sizeof(rsp_fields));
     rsp_fields.uuids128 = (ble_uuid128_t *)&gatt_svr_svc_uart_uuid;
     rsp_fields.num_uuids128 = 1;
@@ -153,7 +152,6 @@ static void ble_advertise(void) {
         ESP_LOGE(TAG, "Error setting scan response fields: rc=%d", rc);
     }
 
-    // 3. Start advertising
     memset(&adv_params, 0, sizeof(adv_params));
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
