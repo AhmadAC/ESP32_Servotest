@@ -37,4 +37,4 @@ Text Commands Accepted over BLE:
 - 'vol <0-100>'                        : Set speaker volume
 - 'pins <bclk> <lrc> <din>'            : Dynamically reassign I2S pins
 - 'status'                             : Query angles, volume, and pins
-================================================================================
+===============================================================================
