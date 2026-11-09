@@ -15,8 +15,8 @@ else()
 endif()
 
 idf_component_register(
-    SRCS "main.cpp" "audio_player.cpp"
+    SRCS "main.cpp" "audio_player.cpp" "ble_server.cpp"
     INCLUDE_DIRS "."
-    REQUIRES esp_http_server esp_wifi esp_netif nvs_flash driver esp_timer lwip
+    REQUIRES esp_http_server esp_wifi esp_netif nvs_flash driver esp_timer lwip bt
     EMBED_FILES "${AUDIO_FILE}"
 )

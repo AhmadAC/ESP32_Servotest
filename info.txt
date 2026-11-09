@@ -13,7 +13,7 @@ Signal (PWM)    Orange / Yellow     GPIO 4 (GP4)        50Hz LEDC hardware PWM s
 2. HT517 I2S AMPLIFIER WIRING (V1.0.2 SILKSCREEN):
 --------------------------------------------------------------------------------
 HT517 Pin       Function            YD-ESP32-S3 Pin     Notes
-Vin             Power Supply        5V / 3.3V           5V recommended for full 3.1W volume
+Vin             Power Supply        5V / 3.3V           5V recommended for full volume
 GND             Ground              GND                 Common Ground
 EN              Enable / Mute       NC (Unconnected)    Internal pull-up; leave floating
 GAIN            Gain Select         NC (Unconnected)    Floating for default gain
@@ -22,11 +22,19 @@ DIO (DI0)       Bit Clock (BCLK)    GPIO 10             I2S Channel 0 Clock
 DI1             Word Select (LRC)   GPIO 11             I2S Left / Right Frame Sync
 
 
-3. OPTIONAL PDM MICROPHONE WIRING:
+3. BLUETOOTH LOW ENERGY (BLE) SPECIFICATION:
 --------------------------------------------------------------------------------
-Mic Pin         Function            YD-ESP32-S3 Pin     Notes
-CLK             Clock               GPIO 42             PDM Clock Output
-DAT             Data                GPIO 41             PDM Data Input
-VCC             Power               3.3V
-GND             Ground              GND
+Device Advertised Name:     ESP32S3-Servo
+GATT Service (NUS):         6e400001-b5a3-f393-e0a9-e50e24dcca9e
+RX Characteristic (Write):  6e400002-b5a3-f393-e0a9-e50e24dcca9e
+TX Characteristic (Notify): 6e400003-b5a3-f393-e0a9-e50e24dcca9e
+
+Text Commands Accepted over BLE:
+- '0' through '180' (or 'angle <deg>') : Adjust servo position
+- 'bark'                               : Play embedded dog bark audio
+- 'beep'                               : Play diagnostic test tone
+- 'stop'                               : Stop audio playback
+- 'vol <0-100>'                        : Set speaker volume
+- 'pins <bclk> <lrc> <din>'            : Dynamically reassign I2S pins
+- 'status'                             : Query angles, volume, and pins
 ================================================================================

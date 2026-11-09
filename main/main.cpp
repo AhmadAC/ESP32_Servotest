@@ -21,6 +21,7 @@
 #include "lwip/err.h"
 #include "lwip/sys.h"
 #include "audio_player.h"
+#include "ble_server.h"
 
 static const char *TAG = "MAIN_APP";
 
@@ -39,6 +40,10 @@ static const char *TAG = "MAIN_APP";
 
 static int current_servo_angle = 90;
 static httpd_handle_t server = NULL;
+
+// Forward Declarations
+static void notify_all_status(void);
+static void process_unified_command(const char *cmd_line, void (*print_fn)(const char *));
 
 // =========================================================================
 // SERVO LEDC CONTROLLER FUNCTIONS
@@ -85,6 +90,142 @@ static void servo_set_angle(int angle) {
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
 
     ESP_LOGI(TAG, "Servo moved to %d deg (duty: %lu)", angle, (unsigned long)duty);
+}
+
+static int servo_get_angle(void) {
+    return current_servo_angle;
+}
+
+// Broadcasts status string to connected BLE clients: STATUS:angle=A,vol=V,bclk=B,lrc=L,din=D
+static void notify_all_status(void) {
+    if (!ble_server_is_connected()) return;
+
+    int bclk = 10, lrc = 11, din = 12;
+    audio_get_pins(&bclk, &lrc, &din);
+
+    char status_str[128];
+    snprintf(status_str, sizeof(status_str),
+             "STATUS:angle=%d,vol=%d,bclk=%d,lrc=%d,din=%d\n",
+             current_servo_angle, audio_get_volume(), bclk, lrc, din);
+    ble_server_send_notify(status_str);
+}
+
+// =========================================================================
+// UNIFIED COMMAND PROCESSOR (SERIAL & BLE SHARE THIS LOGIC)
+// =========================================================================
+static void process_unified_command(const char *cmd_line, void (*print_fn)(const char *)) {
+    if (!cmd_line || !print_fn) return;
+
+    const char *p = cmd_line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0') return;
+
+    // Check if command is direct integer angle (e.g. "90")
+    bool is_numeric = true;
+    int p_len = strlen(p);
+    for (int j = 0; j < p_len; j++) {
+        if (!isdigit((unsigned char)p[j])) {
+            is_numeric = false;
+            break;
+        }
+    }
+
+    if (is_numeric) {
+        int req_angle = atoi(p);
+        if (req_angle >= 0 && req_angle <= 180) {
+            servo_set_angle(req_angle);
+            char msg[64];
+            snprintf(msg, sizeof(msg), ">> Servo moved to %d deg\n", req_angle);
+            print_fn(msg);
+            notify_all_status();
+        } else {
+            print_fn(">> Error: Angle must be between 0 and 180 degrees.\n");
+        }
+        return;
+    }
+
+    if (strncmp(p, "angle ", 6) == 0) {
+        int req_angle = atoi(p + 6);
+        if (req_angle >= 0 && req_angle <= 180) {
+            servo_set_angle(req_angle);
+            char msg[64];
+            snprintf(msg, sizeof(msg), ">> Servo moved to %d deg\n", req_angle);
+            print_fn(msg);
+            notify_all_status();
+        } else {
+            print_fn(">> Error: Angle must be between 0 and 180 degrees.\n");
+        }
+    } else if (strcmp(p, "bark") == 0 || strcmp(p, "play") == 0 || strcmp(p, "sound") == 0) {
+        audio_play("dog_bark");
+        char msg[64];
+        snprintf(msg, sizeof(msg), ">> Playing dog bark on HT517 (Volume: %d%%)\n", audio_get_volume());
+        print_fn(msg);
+    } else if (strcmp(p, "beep") == 0 || strcmp(p, "test") == 0) {
+        audio_play_test_beep();
+        print_fn(">> Playing test beep chime on HT517 speaker...\n");
+    } else if (strcmp(p, "stop") == 0) {
+        audio_stop();
+        print_fn(">> Audio playback stopped.\n");
+    } else if (strncmp(p, "vol ", 4) == 0 || strncmp(p, "volume ", 7) == 0) {
+        int req_vol = (strncmp(p, "vol ", 4) == 0) ? atoi(p + 4) : atoi(p + 7);
+        if (req_vol >= 0 && req_vol <= 100) {
+            audio_set_volume(req_vol);
+            char msg[64];
+            snprintf(msg, sizeof(msg), ">> Speaker volume set to %d%%\n", req_vol);
+            print_fn(msg);
+            notify_all_status();
+        } else {
+            print_fn(">> Error: Volume must be between 0 and 100.\n");
+        }
+    } else if (strncmp(p, "pins ", 5) == 0) {
+        int b = 0, l = 0, d = 0;
+        if (sscanf(p + 5, "%d %d %d", &b, &l, &d) == 3) {
+            audio_set_pins(b, l, d);
+            char msg[64];
+            snprintf(msg, sizeof(msg), ">> Audio pins updated: BCLK=%d, LRC=%d, DIN=%d\n", b, l, d);
+            print_fn(msg);
+            notify_all_status();
+        } else {
+            print_fn(">> Usage: pins <bclk> <lrc> <din> (e.g. 'pins 10 11 12')\n");
+        }
+    } else if (strcmp(p, "status") == 0) {
+        int bclk = 10, lrc = 11, din = 12;
+        audio_get_pins(&bclk, &lrc, &din);
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 ">> Servo: %d deg | Vol: %d%% | Pins: BCLK=%d LRC=%d DIN=%d | BLE: %s | Web: http://192.168.4.1/\n",
+                 current_servo_angle, audio_get_volume(), bclk, lrc, din,
+                 ble_server_is_connected() ? "Connected" : "Advertising");
+        print_fn(msg);
+        notify_all_status();
+    } else if (strcmp(p, "help") == 0 || strcmp(p, "?") == 0) {
+        print_fn("Available Commands:\n"
+                 "  0 - 180          : Move servo angle directly\n"
+                 "  angle <0-180>    : Move servo angle\n"
+                 "  bark / play      : Play dog bark sound\n"
+                 "  beep / test      : Play diagnostic tone\n"
+                 "  stop             : Stop speaker playback\n"
+                 "  vol <0-100>      : Set volume\n"
+                 "  pins 10 11 12    : Preset 1 (YD Default)\n"
+                 "  pins 8 7 9       : Preset 2 (Seeed)\n"
+                 "  pins 12 11 10    : Preset 3 (Swapped)\n"
+                 "  status           : Show device status\n"
+                 "  reboot / restart : Restart ESP32-S3\n");
+    } else if (strcmp(p, "reboot") == 0 || strcmp(p, "restart") == 0) {
+        print_fn("Rebooting ESP32-S3...\n");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_restart();
+    } else {
+        char err_msg[64];
+        snprintf(err_msg, sizeof(err_msg), ">> Unknown command: '%s'. Enter 'help'.\n", p);
+        print_fn(err_msg);
+    }
+}
+
+// Callback invoked when incoming data arrives via BLE RX characteristic
+static void on_ble_command(const char *cmd, void (*reply_fn)(const char *reply)) {
+    ESP_LOGI(TAG, "BLE Command received: '%s'", cmd);
+    process_unified_command(cmd, reply_fn);
 }
 
 // =========================================================================
@@ -180,7 +321,7 @@ static void dns_server_task(void *pvParameters) {
 }
 
 // =========================================================================
-// SERIAL CONSOLE TASK (NON-BLOCKING DUAL LISTEN: UART0 & USB SERIAL/JTAG)
+// SERIAL CONSOLE TASK (UART0 & USB SERIAL/JTAG)
 // =========================================================================
 static void console_print(const char *str) {
     size_t len = strlen(str);
@@ -208,22 +349,10 @@ static void console_read_task(void *pvParameter) {
     const char *banner =
         "\n==================================================\n"
         "   YD-ESP32-S3 Interactive Console Ready\n"
+        "   Control Modes: Wi-Fi (192.168.4.1) & BLE UART\n"
         "==================================================\n"
-        "Servo Commands:\n"
-        "  0 - 180          : Move servo angle directly (e.g. '90')\n"
-        "  angle <N>        : Move servo angle (e.g. 'angle 45')\n"
-        "Speaker Audio Commands:\n"
-        "  bark / play      : Play dog bark sound on HT517\n"
-        "  beep / test      : Play diagnostic test beep on HT517\n"
-        "  stop             : Stop speaker playback\n"
-        "  vol <0-100>      : Set volume percentage (e.g. 'vol 85')\n"
-        "  pins 10 11 12    : Preset 1: YD Default (BCLK:10, LRC:11, DIN:12)\n"
-        "  pins 8 7 9       : Preset 2: Seeed Wiring (BCLK:8, LRC:7, DIN:9)\n"
-        "  pins 12 11 10    : Preset 3: Swapped Wiring (BCLK:12, LRC:11, DIN:10)\n"
-        "General Commands:\n"
-        "  status           : Show servo angle, volume, pins & Wi-Fi IP\n"
-        "  reboot / restart : Restart ESP32-S3 board\n"
-        "  help             : Show command list\n"
+        "Commands: '0-180', 'bark', 'beep', 'stop', 'vol <0-100>',\n"
+        "          'pins 10 11 12', 'status', 'help'\n"
         "==================================================\n"
         "REPL> ";
     console_print(banner);
@@ -252,101 +381,7 @@ static void console_read_task(void *pvParameter) {
                 if (cmd_idx > 0) {
                     cmd_buf[cmd_idx] = '\0';
                     console_print("\n");
-
-                    char *p = cmd_buf;
-                    while (*p == ' ' || *p == '\t') p++;
-
-                    bool is_numeric = true;
-                    int p_len = strlen(p);
-                    if (p_len == 0) is_numeric = false;
-                    for (int j = 0; j < p_len; j++) {
-                        if (!isdigit((unsigned char)p[j])) {
-                            is_numeric = false;
-                            break;
-                        }
-                    }
-
-                    if (is_numeric) {
-                        int req_angle = atoi(p);
-                        if (req_angle >= 0 && req_angle <= 180) {
-                            servo_set_angle(req_angle);
-                            char msg[64];
-                            snprintf(msg, sizeof(msg), ">> Servo moved to %d deg\n", req_angle);
-                            console_print(msg);
-                        } else {
-                            console_print(">> Error: Angle must be between 0 and 180 degrees.\n");
-                        }
-                    } else if (strncmp(p, "angle ", 6) == 0) {
-                        int req_angle = atoi(p + 6);
-                        if (req_angle >= 0 && req_angle <= 180) {
-                            servo_set_angle(req_angle);
-                            char msg[64];
-                            snprintf(msg, sizeof(msg), ">> Servo moved to %d deg\n", req_angle);
-                            console_print(msg);
-                        } else {
-                            console_print(">> Error: Angle must be between 0 and 180 degrees.\n");
-                        }
-                    } else if (strcmp(p, "bark") == 0 || strcmp(p, "play") == 0 || strcmp(p, "sound") == 0) {
-                        audio_play("dog_bark");
-                        char msg[64];
-                        snprintf(msg, sizeof(msg), ">> Playing dog bark on HT517 (Volume: %d%%)\n", audio_get_volume());
-                        console_print(msg);
-                    } else if (strcmp(p, "beep") == 0 || strcmp(p, "test") == 0) {
-                        audio_play_test_beep();
-                        console_print(">> Playing test beep chime on HT517 speaker...\n");
-                    } else if (strcmp(p, "stop") == 0) {
-                        audio_stop();
-                        console_print(">> Audio playback stopped.\n");
-                    } else if (strncmp(p, "vol ", 4) == 0 || strncmp(p, "volume ", 7) == 0) {
-                        int req_vol = (strncmp(p, "vol ", 4) == 0) ? atoi(p + 4) : atoi(p + 7);
-                        if (req_vol >= 0 && req_vol <= 100) {
-                            audio_set_volume(req_vol);
-                            char msg[64];
-                            snprintf(msg, sizeof(msg), ">> Speaker volume set to %d%%\n", req_vol);
-                            console_print(msg);
-                        } else {
-                            console_print(">> Error: Volume must be between 0 and 100.\n");
-                        }
-                    } else if (strncmp(p, "pins ", 5) == 0) {
-                        int b = 0, l = 0, d = 0;
-                        if (sscanf(p + 5, "%d %d %d", &b, &l, &d) == 3) {
-                            audio_set_pins(b, l, d);
-                            char msg[64];
-                            snprintf(msg, sizeof(msg), ">> Audio pins updated: BCLK=%d, LRC=%d, DIN=%d\n", b, l, d);
-                            console_print(msg);
-                        } else {
-                            console_print(">> Usage: pins <bclk> <lrc> <din> (e.g. 'pins 10 11 12' or 'pins 8 7 9')\n");
-                        }
-                    } else if (strcmp(p, "status") == 0) {
-                        int bclk = 10, lrc = 11, din = 12;
-                        audio_get_pins(&bclk, &lrc, &din);
-                        char msg[128];
-                        snprintf(msg, sizeof(msg),
-                                 ">> Servo: %d deg | Vol: %d%% | Pins: BCLK=%d LRC=%d DIN=%d | Web: http://192.168.4.1/\n",
-                                 current_servo_angle, audio_get_volume(), bclk, lrc, din);
-                        console_print(msg);
-                    } else if (strcmp(p, "help") == 0 || strcmp(p, "?") == 0) {
-                        console_print("Available Commands:\n"
-                                      "  0 - 180          : Move servo angle\n"
-                                      "  bark / play      : Play dog bark sound\n"
-                                      "  beep / test      : Play diagnostic beep\n"
-                                      "  stop             : Stop speaker playback\n"
-                                      "  vol <0-100>      : Set volume\n"
-                                      "  pins 10 11 12    : Use YD Default pins\n"
-                                      "  pins 8 7 9       : Use Seeed Wiring pins\n"
-                                      "  pins 12 11 10    : Use Swapped Wiring pins\n"
-                                      "  status           : Show device status\n"
-                                      "  reboot / restart : Restart ESP32-S3\n");
-                    } else if (strcmp(p, "reboot") == 0 || strcmp(p, "restart") == 0) {
-                        console_print("Rebooting ESP32-S3...\n");
-                        vTaskDelay(pdMS_TO_TICKS(100));
-                        esp_restart();
-                    } else {
-                        console_print(">> Unknown command: '");
-                        console_print(p);
-                        console_print("'. Enter a number (0-180), 'bark', 'beep', 'pins', or 'help'.\n");
-                    }
-
+                    process_unified_command(cmd_buf, console_print);
                     cmd_idx = 0;
                     console_print("REPL> ");
                 } else {
@@ -370,7 +405,7 @@ static void console_read_task(void *pvParameter) {
 }
 
 // =========================================================================
-// HTML / WEB INTERFACE (RESPONSIVE FOR IPHONE CNA & DESKTOP BROWSERS)
+// HTML / WEB PORTAL INTERFACE
 // =========================================================================
 static const char INDEX_HTML[] = R"rawliteral(
 <!DOCTYPE html>
@@ -391,7 +426,6 @@ static const char INDEX_HTML[] = R"rawliteral(
             --accent: #10b981;
             --accent-hover: #059669;
             --danger: #ef4444;
-            --danger-hover: #dc2626;
             --text-color: #f8fafc;
             --muted-text: #94a3b8;
         }
@@ -506,13 +540,13 @@ static const char INDEX_HTML[] = R"rawliteral(
 <body>
     <div class="container">
         <h1>YD-ESP32-S3 Dashboard</h1>
-        <div class="sub-header">Servo (GPIO 4) &amp; HT517 Speaker Controller</div>
+        <div class="sub-header">Dual Wi-Fi &amp; Bluetooth LE Controller</div>
 
-        <!-- SERVO MOTOR CONTROL SECTION -->
+        <!-- SERVO MOTOR CONTROL -->
         <div class="section-box">
             <div class="section-title">
                 <span>Servo Position</span>
-                <span style="color: var(--primary);">LEDC 50Hz</span>
+                <span style="color: var(--primary);">GPIO 4</span>
             </div>
             <div>
                 <span class="readout" id="angleVal">90</span><span class="readout-unit">&deg;</span>
@@ -532,7 +566,7 @@ static const char INDEX_HTML[] = R"rawliteral(
             </div>
         </div>
 
-        <!-- HT517 SPEAKER CONTROL SECTION -->
+        <!-- HT517 SPEAKER CONTROL -->
         <div class="section-box">
             <div class="section-title">
                 <span>HT517 Speaker Audio</span>
@@ -546,7 +580,7 @@ static const char INDEX_HTML[] = R"rawliteral(
             </div>
 
             <div style="margin: 10px 0 6px 0; text-align: left; font-size: 0.75rem; color: var(--muted-text);">
-                Hardware Pin Selection (Tap to Test):
+                Hardware Pin Selection:
             </div>
             <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 12px;">
                 <button id="btnPinYD" class="btn-pin active" onclick="applyPins(10, 11, 12)">1: 10,11,12</button>
@@ -562,15 +596,15 @@ static const char INDEX_HTML[] = R"rawliteral(
         </div>
 
         <div class="status-bar">
-            <span class="status-dot"></span><span id="connStatus">Portal Connected (192.168.4.1)</span>
+            <span class="status-dot"></span><span id="connStatus">Wi-Fi Connected (192.168.4.1)</span>
         </div>
     </div>
 
     <script>
-        let pendingAngle = null;
         let isAngleThrottled = false;
-        let pendingVol = null;
+        let pendingAngle = null;
         let isVolThrottled = false;
+        let pendingVol = null;
 
         function updateAngleDisplay(val) {
             document.getElementById("angleVal").innerText = val;
@@ -600,11 +634,10 @@ static const char INDEX_HTML[] = R"rawliteral(
         }
 
         function sendAngle(val) {
-            document.getElementById("connStatus").innerText = "Setting angle: " + val + "°";
             fetch('/set?angle=' + val)
                 .then(r => r.text())
                 .then(t => { document.getElementById("connStatus").innerText = "Servo Angle: " + val + "°"; })
-                .catch(e => { document.getElementById("connStatus").innerText = "Servo command error"; });
+                .catch(e => {});
         }
 
         function updateVolDisplay(val) {
@@ -633,45 +666,31 @@ static const char INDEX_HTML[] = R"rawliteral(
             fetch('/volume?val=' + val)
                 .then(r => r.text())
                 .then(t => { document.getElementById("connStatus").innerText = "Speaker Volume: " + val + "%"; })
-                .catch(e => { document.getElementById("connStatus").innerText = "Volume error"; });
+                .catch(e => {});
         }
 
         function playBark() {
-            document.getElementById("connStatus").innerText = "Playing dog bark audio...";
-            fetch('/play?sound=dog_bark')
-                .then(r => r.text())
-                .then(t => { document.getElementById("connStatus").innerText = "Dog bark playing on HT517"; })
-                .catch(e => { document.getElementById("connStatus").innerText = "Play command error"; });
+            fetch('/play?sound=dog_bark');
         }
 
         function playBeep() {
-            document.getElementById("connStatus").innerText = "Playing diagnostic test tone...";
-            fetch('/beep')
-                .then(r => r.text())
-                .then(t => { document.getElementById("connStatus").innerText = "Test tone playing on HT517"; })
-                .catch(e => { document.getElementById("connStatus").innerText = "Beep command error"; });
+            fetch('/beep');
         }
 
         function stopAudio() {
-            document.getElementById("connStatus").innerText = "Stopping speaker audio...";
-            fetch('/stop')
-                .then(r => r.text())
-                .then(t => { document.getElementById("connStatus").innerText = "Speaker playback stopped"; })
-                .catch(e => { document.getElementById("connStatus").innerText = "Stop command error"; });
+            fetch('/stop');
         }
 
         function applyPins(b, l, d) {
-            document.getElementById("connStatus").innerText = "Switching audio pins...";
             fetch(`/set_pins?bclk=${b}&lrc=${l}&din=${d}`)
                 .then(r => r.text())
                 .then(t => {
-                    document.getElementById("connStatus").innerText = `Pins: BCLK=${b}, LRC=${l}, DIN=${d}`;
-                    updatePinButtons(b, l);
+                    updatePinButtons(b);
                     setTimeout(playBeep, 150);
                 });
         }
 
-        function updatePinButtons(bclk, lrc) {
+        function updatePinButtons(bclk) {
             document.getElementById("btnPinYD").classList.remove("active");
             document.getElementById("btnPinSeeed").classList.remove("active");
             document.getElementById("btnPinSwap").classList.remove("active");
@@ -691,9 +710,9 @@ static const char INDEX_HTML[] = R"rawliteral(
                 .then(data => {
                     if (data.angle !== undefined) updateAngleDisplay(data.angle);
                     if (data.volume !== undefined) updateVolDisplay(data.volume);
-                    if (data.bclk !== undefined) updatePinButtons(data.bclk, data.lrc);
+                    if (data.bclk !== undefined) updatePinButtons(data.bclk);
                 })
-                .catch(err => { console.log("Init status error", err); });
+                .catch(err => {});
         };
     </script>
 </body>
@@ -732,6 +751,7 @@ static esp_err_t set_angle_handler(httpd_req_t *req) {
         if (httpd_query_key_value(query, "angle", param, sizeof(param)) == ESP_OK) {
             int requested_angle = atoi(param);
             servo_set_angle(requested_angle);
+            notify_all_status();
 
             char resp[32];
             snprintf(resp, sizeof(resp), "OK %d", current_servo_angle);
@@ -740,7 +760,7 @@ static esp_err_t set_angle_handler(httpd_req_t *req) {
             return ESP_OK;
         }
     }
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing 'angle' query param");
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing 'angle' param");
     return ESP_FAIL;
 }
 
@@ -795,6 +815,7 @@ static esp_err_t set_volume_handler(httpd_req_t *req) {
             httpd_query_key_value(query, "volume", param, sizeof(param)) == ESP_OK) {
             int vol = atoi(param);
             audio_set_volume(vol);
+            notify_all_status();
 
             char resp[32];
             snprintf(resp, sizeof(resp), "OK %d", audio_get_volume());
@@ -803,7 +824,7 @@ static esp_err_t set_volume_handler(httpd_req_t *req) {
             return ESP_OK;
         }
     }
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing 'val' query param");
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing 'val' param");
     return ESP_FAIL;
 }
 
@@ -816,6 +837,7 @@ static esp_err_t set_pins_handler(httpd_req_t *req) {
         httpd_query_key_value(query, "din",  p_din,  sizeof(p_din));
         if (p_bclk[0] && p_lrc[0] && p_din[0]) {
             audio_set_pins(atoi(p_bclk), atoi(p_lrc), atoi(p_din));
+            notify_all_status();
             httpd_resp_set_type(req, "text/plain");
             httpd_resp_send(req, "PINS_UPDATED", HTTPD_RESP_USE_STRLEN);
             return ESP_OK;
@@ -958,13 +980,13 @@ extern "C" void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // 1. Initialize Wi-Fi stack & TCP/IP
+    // 1. Initialize Wi-Fi stack & Soft-AP
     wifi_init_softap();
 
     // 2. Start Captive DNS Server (UDP port 53)
     xTaskCreatePinnedToCore(dns_server_task, "dns_server_task", 4096, NULL, 5, NULL, 0);
 
-    // 3. Initialize hardware PWM on GPIO 4 for servo control
+    // 3. Initialize hardware PWM on GPIO 4 for servo
     servo_init();
 
     // 4. Initialize HT517 I2S audio driver & background tasks
@@ -973,6 +995,9 @@ extern "C" void app_main(void) {
     // 5. Start HTTP web server with Captive Portal routes
     start_webserver();
 
-    // 6. Start non-blocking dual console task (USB Serial/JTAG + UART0)
+    // 6. Initialize Bluetooth Low Energy Nordic UART Service
+    ble_server_init(on_ble_command);
+
+    // 7. Start interactive serial console (USB Serial/JTAG + UART0)
     xTaskCreate(console_read_task, "console_read_task", 4096, NULL, 5, NULL);
 }
