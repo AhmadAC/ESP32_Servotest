@@ -57,11 +57,6 @@ static int gatt_svr_chr_access_rx(uint16_t conn_handle, uint16_t attr_handle,
 
 static int gatt_svr_chr_access_tx(uint16_t conn_handle, uint16_t attr_handle,
                                    struct ble_gatt_access_ctxt *ctxt, void *arg) {
-    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-        const char *val = "READY\n";
-        int rc = os_mbuf_append(ctxt->om, val, strlen(val));
-        return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
-    }
     return BLE_ATT_ERR_UNLIKELY;
 }
 
@@ -78,7 +73,7 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
             {
                 .uuid = &gatt_svr_chr_tx_uuid.u,
                 .access_cb = gatt_svr_chr_access_tx,
-                .flags = BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ,
+                .flags = BLE_GATT_CHR_F_NOTIFY,
                 .val_handle = &s_tx_val_handle,
             },
             { 0 }
