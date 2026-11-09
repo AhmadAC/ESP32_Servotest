@@ -27,7 +27,7 @@ static ble_cmd_callback_t s_cmd_handler = NULL;
 static void ble_advertise(void);
 
 static void dummy_reply_fn(const char *reply) {
-    // Write-only mode; replies are directed to UART console
+    // Write-only mode; replies are handled cleanly over console
 }
 
 static int gatt_svr_chr_access_rx(uint16_t conn_handle, uint16_t attr_handle,
@@ -78,17 +78,8 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                  event->connect.status);
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
-
-            // Negotiate iOS connection intervals: 15ms to 30ms, 4s supervision timeout
-            struct ble_gap_upd_params params = {
-                .itvl_min = 12, // 15ms
-                .itvl_max = 24, // 30ms
-                .latency  = 0,
-                .supervision_timeout = 400, // 4 seconds
-                .min_ce_len = 0,
-                .max_ce_len = 0,
-            };
-            ble_gap_update_params(s_conn_handle, &params);
+            // CRITICAL FIX: Do NOT call ble_gap_update_params here!
+            // Apple requires peripherals to let iOS establish connection parameters.
         } else {
             ble_advertise();
         }
@@ -194,7 +185,7 @@ void ble_server_init(ble_cmd_callback_t cmd_handler) {
     }
 
     nimble_port_freertos_init(ble_host_task);
-    ESP_LOGI(TAG, "BLE Server ready (Crash-Proof Write-Only GATT Engine)");
+    ESP_LOGI(TAG, "BLE Server ready (Standard Apple-Compliant BLE Engine)");
 }
 
 bool ble_server_is_connected(void) {
@@ -202,5 +193,5 @@ bool ble_server_is_connected(void) {
 }
 
 void ble_server_send_notify(const char *message) {
-    // Write-only mode; replies are handled cleanly over console
+    // Write-only mode; status is handled via console
 }
