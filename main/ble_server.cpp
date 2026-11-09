@@ -95,7 +95,6 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                  event->connect.status);
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
-            // CRITICAL FIX: Do NOT send notifications here before iOS has discovered services!
         } else {
             ble_advertise();
         }
@@ -113,10 +112,6 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
 
     case BLE_GAP_EVENT_SUBSCRIBE:
         ESP_LOGI(TAG, "BLE Subscribe event: cur_notify=%d", event->subscribe.cur_notify);
-        // Only notify after iOS has confirmed characteristic subscription
-        if (event->subscribe.cur_notify == 1) {
-            ble_server_send_notify(">> Connected to ESP32S3-Servo\n");
-        }
         return 0;
 
     default:
