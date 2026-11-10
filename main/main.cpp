@@ -22,6 +22,7 @@
 #include "lwip/sys.h"
 #include "audio_player.h"
 #include "ble_server.h"
+#include "keypad.h"
 
 static const char *TAG = "MAIN_APP";
 
@@ -44,6 +45,7 @@ static httpd_handle_t server = NULL;
 // Forward Declarations
 static void notify_all_status(void);
 static void process_unified_command(const char *cmd_line, void (*print_fn)(const char *));
+static void console_print(const char *str);
 
 // =========================================================================
 // SERVO LEDC CONTROLLER FUNCTIONS
@@ -92,10 +94,6 @@ static void servo_set_angle(int angle) {
     ESP_LOGI(TAG, "Servo moved to %d deg (duty: %lu)", angle, (unsigned long)duty);
 }
 
-static int servo_get_angle(void) {
-    return current_servo_angle;
-}
-
 // Broadcasts status string to connected BLE clients: STATUS:angle=A,vol=V,bclk=B,lrc=L,din=D
 static void notify_all_status(void) {
     if (!ble_server_is_connected()) return;
@@ -111,7 +109,7 @@ static void notify_all_status(void) {
 }
 
 // =========================================================================
-// UNIFIED COMMAND PROCESSOR (SERIAL & BLE SHARE THIS LOGIC)
+// UNIFIED COMMAND PROCESSOR (SERIAL, BLE, KEYPAD & WEB SHARE THIS LOGIC)
 // =========================================================================
 static void process_unified_command(const char *cmd_line, void (*print_fn)(const char *)) {
     if (!cmd_line || !print_fn) return;
@@ -144,6 +142,21 @@ static void process_unified_command(const char *cmd_line, void (*print_fn)(const
         return;
     }
 
+    // Relative claw nudging: "nudge <+/-deg>" or "+5" or "-10"
+    if (strncmp(p, "nudge ", 6) == 0 ||
+        ((p[0] == '+' || p[0] == '-') && isdigit((unsigned char)p[1]))) {
+        int delta = (strncmp(p, "nudge ", 6) == 0) ? atoi(p + 6) : atoi(p);
+        int target = current_servo_angle + delta;
+        if (target < 0) target = 0;
+        if (target > 180) target = 180;
+        servo_set_angle(target);
+        char msg[64];
+        snprintf(msg, sizeof(msg), ">> Servo nudged by %+d -> %d deg\n", delta, target);
+        print_fn(msg);
+        notify_all_status();
+        return;
+    }
+
     if (strncmp(p, "angle ", 6) == 0) {
         int req_angle = atoi(p + 6);
         if (req_angle >= 0 && req_angle <= 180) {
@@ -167,16 +180,21 @@ static void process_unified_command(const char *cmd_line, void (*print_fn)(const
         audio_stop();
         print_fn(">> Audio playback stopped.\n");
     } else if (strncmp(p, "vol ", 4) == 0 || strncmp(p, "volume ", 7) == 0) {
-        int req_vol = (strncmp(p, "vol ", 4) == 0) ? atoi(p + 4) : atoi(p + 7);
-        if (req_vol >= 0 && req_vol <= 100) {
-            audio_set_volume(req_vol);
-            char msg[64];
-            snprintf(msg, sizeof(msg), ">> Speaker volume set to %d%%\n", req_vol);
-            print_fn(msg);
-            notify_all_status();
+        const char *v_str = (strncmp(p, "vol ", 4) == 0) ? (p + 4) : (p + 7);
+        while (*v_str == ' ') v_str++;
+        int target_vol = 0;
+        if (v_str[0] == '+' || v_str[0] == '-') {
+            target_vol = audio_get_volume() + atoi(v_str);
         } else {
-            print_fn(">> Error: Volume must be between 0 and 100.\n");
+            target_vol = atoi(v_str);
         }
+        if (target_vol < 0) target_vol = 0;
+        if (target_vol > 100) target_vol = 100;
+        audio_set_volume(target_vol);
+        char msg[64];
+        snprintf(msg, sizeof(msg), ">> Speaker volume set to %d%%\n", target_vol);
+        print_fn(msg);
+        notify_all_status();
     } else if (strncmp(p, "pins ", 5) == 0) {
         int b = 0, l = 0, d = 0;
         if (sscanf(p + 5, "%d %d %d", &b, &l, &d) == 3) {
@@ -191,7 +209,7 @@ static void process_unified_command(const char *cmd_line, void (*print_fn)(const
     } else if (strcmp(p, "status") == 0) {
         int bclk = 10, lrc = 11, din = 12;
         audio_get_pins(&bclk, &lrc, &din);
-        char msg[128];
+        char msg[140];
         snprintf(msg, sizeof(msg),
                  ">> Servo: %d deg | Vol: %d%% | Pins: BCLK=%d LRC=%d DIN=%d | BLE: %s | Web: http://192.168.4.1/\n",
                  current_servo_angle, audio_get_volume(), bclk, lrc, din,
@@ -202,10 +220,11 @@ static void process_unified_command(const char *cmd_line, void (*print_fn)(const
         print_fn("Available Commands:\n"
                  "  0 - 180          : Move servo angle directly\n"
                  "  angle <0-180>    : Move servo angle\n"
+                 "  nudge <+/-deg>   : Nudge angle (e.g. 'nudge +10', '-5')\n"
                  "  bark / play      : Play dog bark sound\n"
                  "  beep / test      : Play diagnostic tone\n"
                  "  stop             : Stop speaker playback\n"
-                 "  vol <0-100>      : Set volume\n"
+                 "  vol <0-100>      : Set volume (or 'vol +10', 'vol -10')\n"
                  "  pins 10 11 12    : Preset 1 (YD Default)\n"
                  "  pins 8 7 9       : Preset 2 (Seeed)\n"
                  "  pins 12 11 10    : Preset 3 (Swapped)\n"
@@ -226,6 +245,14 @@ static void process_unified_command(const char *cmd_line, void (*print_fn)(const
 static void on_ble_command(const char *cmd, void (*reply_fn)(const char *reply)) {
     ESP_LOGI(TAG, "BLE Command received: '%s'", cmd);
     process_unified_command(cmd, reply_fn);
+}
+
+// Callback invoked when a 16-key matrix keyboard button is pressed
+static void on_keypad_command(const char *cmd) {
+    char log_buf[64];
+    snprintf(log_buf, sizeof(log_buf), "\n[Matrix Keypad Action] -> '%s'\n", cmd);
+    console_print(log_buf);
+    process_unified_command(cmd, console_print);
 }
 
 // =========================================================================
@@ -349,10 +376,10 @@ static void console_read_task(void *pvParameter) {
     const char *banner =
         "\n==================================================\n"
         "   YD-ESP32-S3 Interactive Console Ready\n"
-        "   Control Modes: Wi-Fi (192.168.4.1) & BLE UART\n"
+        "   Control Modes: Wi-Fi, BLE, 4x4 Keypad & USB UART\n"
         "==================================================\n"
-        "Commands: '0-180', 'bark', 'beep', 'stop', 'vol <0-100>',\n"
-        "          'pins 10 11 12', 'status', 'help'\n"
+        "Commands: '0-180', 'nudge <+/-deg>', 'bark', 'beep',\n"
+        "          'vol <0-100>', 'pins 10 11 12', 'status', 'help'\n"
         "==================================================\n"
         "REPL> ";
     console_print(banner);
@@ -415,7 +442,7 @@ static const char INDEX_HTML[] = R"rawliteral(
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <title>YD-ESP32-S3 Controller</title>
+    <title>YD-ESP32-S3 Claw Controller</title>
     <style>
         :root {
             --bg-color: #0b1120;
@@ -425,6 +452,7 @@ static const char INDEX_HTML[] = R"rawliteral(
             --primary-hover: #0284c7;
             --accent: #10b981;
             --accent-hover: #059669;
+            --warning: #f59e0b;
             --danger: #ef4444;
             --text-color: #f8fafc;
             --muted-text: #94a3b8;
@@ -443,14 +471,14 @@ static const char INDEX_HTML[] = R"rawliteral(
         .container {
             background-color: var(--card-color);
             width: 100%;
-            max-width: 440px;
+            max-width: 480px;
             border-radius: 20px;
             padding: 24px 20px;
             box-shadow: 0 10px 25px rgba(0, 0, 0, 0.6);
             border: 1px solid var(--card-border);
             text-align: center;
         }
-        h1 { font-size: 1.4rem; margin-bottom: 4px; color: var(--primary); }
+        h1 { font-size: 1.35rem; margin-bottom: 4px; color: var(--primary); }
         .sub-header { font-size: 0.78rem; color: var(--muted-text); margin-bottom: 18px; }
         .section-box {
             background: #0f172a;
@@ -526,6 +554,57 @@ static const char INDEX_HTML[] = R"rawliteral(
         .btn-stop { background: #475569; padding: 13px 8px; font-size: 0.92rem; grid-column: span 2; }
         .btn-pin { background: #1e293b; border: 1px solid #475569; padding: 8px 6px; font-size: 0.72rem; color: #cbd5e1; border-radius: 8px; }
         .btn-pin.active { background: #0284c7; border-color: #38bdf8; color: #fff; font-weight: bold; }
+        
+        /* 16 Matrix Keypad Grid Styling */
+        .keypad-matrix {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 6px;
+            margin-top: 10px;
+        }
+        .keypad-btn {
+            background: #1e293b;
+            border: 1px solid var(--card-border);
+            border-radius: 10px;
+            padding: 8px 4px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 52px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .keypad-btn:hover { border-color: var(--primary); background: #24334a; }
+        .keypad-btn.active-edit { border-color: #38bdf8; background: #0369a1; box-shadow: 0 0 8px rgba(56, 189, 248, 0.4); }
+        .key-num { font-size: 0.65rem; color: var(--primary); font-weight: 700; text-transform: uppercase; }
+        .key-coord { font-size: 0.58rem; color: var(--muted-text); }
+        .key-cmd { font-size: 0.74rem; font-weight: 600; color: #f8fafc; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 90px; }
+        
+        .editor-box {
+            background: #111827;
+            border: 1px solid #3b82f6;
+            border-radius: 12px;
+            padding: 12px;
+            margin-top: 12px;
+            text-align: left;
+        }
+        .editor-header { display: flex; justify-content: space-between; align-items: center; font-size: 0.78rem; font-weight: 700; color: #93c5fd; margin-bottom: 8px; }
+        .editor-select, .editor-input {
+            width: 100%;
+            background: #1e293b;
+            border: 1px solid #475569;
+            color: #fff;
+            padding: 8px 10px;
+            border-radius: 8px;
+            font-size: 0.8rem;
+            margin-bottom: 8px;
+            outline: none;
+        }
+        .editor-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 4px; }
+        .btn-save-key { background: #10b981; color: white; padding: 8px; font-size: 0.8rem; }
+        .btn-test-key { background: #0284c7; color: white; padding: 8px; font-size: 0.8rem; }
+
         .status-dot {
             display: inline-block;
             width: 8px;
@@ -539,13 +618,13 @@ static const char INDEX_HTML[] = R"rawliteral(
 </head>
 <body>
     <div class="container">
-        <h1>YD-ESP32-S3 Dashboard</h1>
-        <div class="sub-header">Dual Wi-Fi &amp; Bluetooth LE Controller</div>
+        <h1>YD-ESP32-S3 Claw Controller</h1>
+        <div class="sub-header">Wi-Fi &bull; BLE &bull; 16-Key Matrix Keyboard Engine</div>
 
-        <!-- SERVO MOTOR CONTROL -->
+        <!-- SERVO MOTOR / CLAW CONTROL -->
         <div class="section-box">
             <div class="section-title">
-                <span>Servo Position</span>
+                <span>Claw Servo Position</span>
                 <span style="color: var(--primary);">GPIO 4</span>
             </div>
             <div>
@@ -554,7 +633,7 @@ static const char INDEX_HTML[] = R"rawliteral(
             <div class="slider-wrap">
                 <input type="range" id="angleSlider" min="0" max="180" value="90" oninput="onAngleSliderMove(this.value)" onchange="sendAngle(this.value)">
                 <div class="range-labels">
-                    <span>0&deg;</span><span>45&deg;</span><span>90&deg;</span><span>135&deg;</span><span>180&deg;</span>
+                    <span>Closed (0&deg;)</span><span>45&deg;</span><span>90&deg;</span><span>135&deg;</span><span>Open (180&deg;)</span>
                 </div>
             </div>
             <div class="btn-grid">
@@ -566,7 +645,67 @@ static const char INDEX_HTML[] = R"rawliteral(
             </div>
         </div>
 
-        <!-- HT517 SPEAKER CONTROL -->
+        <!-- 16-KEY MATRIX KEYBOARD CONFIGURATION -->
+        <div class="section-box">
+            <div class="section-title">
+                <span>16 Matrix Keyboard (Claw Keypad)</span>
+                <span style="color: #38bdf8;" id="keypadStatusBadge">Persistent (NVS)</span>
+            </div>
+            <div style="font-size: 0.72rem; color: var(--muted-text); text-align: left; margin-bottom: 6px;">
+                Click any key below to reprogram its persistent flash action:
+            </div>
+
+            <div class="keypad-matrix" id="keypadGrid">
+                <!-- 16 Keys will be dynamically rendered or bound -->
+            </div>
+
+            <!-- Key Editor Overlay -->
+            <div class="editor-box" id="editorBox" style="display: none;">
+                <div class="editor-header">
+                    <span id="editorTitle">Edit Key 1 (R1C1)</span>
+                    <span style="font-size: 0.7rem; color: #94a3b8; cursor: pointer;" onclick="closeEditor()">&times; Close</span>
+                </div>
+
+                <label style="font-size: 0.7rem; color: #94a3b8;">Preset Actions:</label>
+                <select class="editor-select" id="presetSelect" onchange="onPresetSelected(this.value)">
+                    <option value="">-- Choose a Preset Action --</option>
+                    <option value="0">Claw: Close Completely (0&deg;)</option>
+                    <option value="45">Claw: Quarter Open (45&deg;)</option>
+                    <option value="90">Claw: Half Open (90&deg;)</option>
+                    <option value="135">Claw: 3/4 Open (135&deg;)</option>
+                    <option value="180">Claw: Open Completely (180&deg;)</option>
+                    <option value="nudge -10">Claw: Nudge Close (-10&deg;)</option>
+                    <option value="nudge +10">Claw: Nudge Open (+10&deg;)</option>
+                    <option value="nudge -2">Claw: Fine Nudge Close (-2&deg;)</option>
+                    <option value="nudge +2">Claw: Fine Nudge Open (+2&deg;)</option>
+                    <option value="bark">Audio: Play Dog Bark</option>
+                    <option value="beep">Audio: Play Diagnostic Tone</option>
+                    <option value="stop">Audio: Stop Sound</option>
+                    <option value="vol -10">Volume: Decrease (-10%)</option>
+                    <option value="vol +10">Volume: Increase (+10%)</option>
+                    <option value="vol 50">Volume: Set to 50%</option>
+                    <option value="vol 80">Volume: Set to 80%</option>
+                    <option value="vol 100">Volume: Maximum 100%</option>
+                    <option value="status">System: Print Status</option>
+                    <option value="reboot">System: Reboot Board</option>
+                </select>
+
+                <label style="font-size: 0.7rem; color: #94a3b8;">Assigned Command Text:</label>
+                <input type="text" class="editor-input" id="customCmdInput" placeholder="e.g. angle 90, bark, nudge +5">
+
+                <div class="editor-actions">
+                    <button class="btn-save-key" onclick="saveActiveKey()">Save to Flash</button>
+                    <button class="btn-test-key" onclick="testActiveKey()">Test Key Now</button>
+                </div>
+            </div>
+
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px;">
+                <span style="font-size: 0.68rem; color: #64748b;">Rows: GPIO 13,14,15,16 &bull; Cols: GPIO 17,18,21,38</span>
+                <button style="background: none; border: 1px solid #475569; font-size: 0.68rem; padding: 4px 8px; border-radius: 6px; color: #cbd5e1;" onclick="resetKeypadDefaults()">Reset All</button>
+            </div>
+        </div>
+
+        <!-- HT517 SPEAKER AUDIO CONTROL -->
         <div class="section-box">
             <div class="section-title">
                 <span>HT517 Speaker Audio</span>
@@ -596,7 +735,7 @@ static const char INDEX_HTML[] = R"rawliteral(
         </div>
 
         <div class="status-bar">
-            <span class="status-dot"></span><span id="connStatus">Wi-Fi Connected (192.168.4.1)</span>
+            <span class="status-dot"></span><span id="connStatus">Ready &bull; 192.168.4.1</span>
         </div>
     </div>
 
@@ -605,6 +744,101 @@ static const char INDEX_HTML[] = R"rawliteral(
         let pendingAngle = null;
         let isVolThrottled = false;
         let pendingVol = null;
+        let activeEditKey = null;
+        let keypadMap = {};
+
+        const KEY_COORDS = [
+            "R1C1", "R1C2", "R1C3", "R1C4",
+            "R2C1", "R2C2", "R2C3", "R2C4",
+            "R3C1", "R3C2", "R3C3", "R3C4",
+            "R4C1", "R4C2", "R4C3", "R4C4"
+        ];
+
+        function renderKeypadGrid() {
+            const grid = document.getElementById("keypadGrid");
+            grid.innerHTML = "";
+            for (let i = 1; i <= 16; i++) {
+                const coord = KEY_COORDS[i - 1];
+                const cmd = keypadMap[i] || "";
+                const btn = document.createElement("div");
+                btn.className = "keypad-btn" + (activeEditKey === i ? " active-edit" : "");
+                btn.id = "kbtn-" + i;
+                btn.onclick = () => openKeyEditor(i);
+                btn.innerHTML = `
+                    <div class="key-num">Key ${i}</div>
+                    <div class="key-coord">${coord}</div>
+                    <div class="key-cmd" title="${cmd}">${cmd || "(empty)"}</div>
+                `;
+                grid.appendChild(btn);
+            }
+        }
+
+        function openKeyEditor(keyNum) {
+            activeEditKey = keyNum;
+            renderKeypadGrid();
+            const coord = KEY_COORDS[keyNum - 1];
+            const currentCmd = keypadMap[keyNum] || "";
+            document.getElementById("editorTitle").innerText = `Edit Key ${keyNum} (${coord})`;
+            document.getElementById("customCmdInput").value = currentCmd;
+            document.getElementById("presetSelect").value = "";
+            document.getElementById("editorBox").style.display = "block";
+        }
+
+        function closeEditor() {
+            activeEditKey = null;
+            document.getElementById("editorBox").style.display = "none";
+            renderKeypadGrid();
+        }
+
+        function onPresetSelected(val) {
+            if (val) {
+                document.getElementById("customCmdInput").value = val;
+            }
+        }
+
+        function saveActiveKey() {
+            if (!activeEditKey) return;
+            const keyNum = activeEditKey;
+            const newCmd = document.getElementById("customCmdInput").value.trim();
+
+            fetch(`/keypad/set?key=${keyNum}&cmd=${encodeURIComponent(newCmd)}`)
+                .then(r => r.text())
+                .then(res => {
+                    keypadMap[keyNum] = newCmd;
+                    document.getElementById("connStatus").innerText = `Key ${keyNum} saved to flash: '${newCmd}'`;
+                    closeEditor();
+                })
+                .catch(err => {
+                    alert("Error saving key: " + err);
+                });
+        }
+
+        function testActiveKey() {
+            const cmd = document.getElementById("customCmdInput").value.trim();
+            if (!cmd) return;
+            fetch(`/keypad/test?cmd=${encodeURIComponent(cmd)}`);
+        }
+
+        function resetKeypadDefaults() {
+            if (!confirm("Reset all 16 keys to factory default actions?")) return;
+            fetch('/keypad/reset')
+                .then(r => r.json())
+                .then(data => {
+                    keypadMap = data;
+                    closeEditor();
+                    document.getElementById("connStatus").innerText = "Keypad restored to defaults.";
+                });
+        }
+
+        function loadKeypadConfig() {
+            fetch('/keypad/get')
+                .then(r => r.json())
+                .then(data => {
+                    keypadMap = data;
+                    renderKeypadGrid();
+                })
+                .catch(e => {});
+        }
 
         function updateAngleDisplay(val) {
             document.getElementById("angleVal").innerText = val;
@@ -713,11 +947,32 @@ static const char INDEX_HTML[] = R"rawliteral(
                     if (data.bclk !== undefined) updatePinButtons(data.bclk);
                 })
                 .catch(err => {});
+            loadKeypadConfig();
         };
     </script>
 </body>
 </html>
 )rawliteral";
+
+// =========================================================================
+// URL DECODE HELPER
+// =========================================================================
+static void url_decode(char *dst, const char *src, size_t dst_len) {
+    size_t d = 0;
+    while (*src && d + 1 < dst_len) {
+        if (*src == '%' && isxdigit((unsigned char)*(src + 1)) && isxdigit((unsigned char)*(src + 2))) {
+            char hex[3] = { src[1], src[2], '\0' };
+            dst[d++] = (char)strtol(hex, NULL, 16);
+            src += 3;
+        } else if (*src == '+') {
+            dst[d++] = ' ';
+            src++;
+        } else {
+            dst[d++] = *src++;
+        }
+    }
+    dst[d] = '\0';
+}
 
 // =========================================================================
 // HTTP SERVER HANDLERS & CAPTIVE REDIRECTORS
@@ -847,10 +1102,72 @@ static esp_err_t set_pins_handler(httpd_req_t *req) {
     return ESP_FAIL;
 }
 
+// Keypad API Handlers
+static esp_err_t keypad_get_handler(httpd_req_t *req) {
+    char json[1024];
+    int offset = snprintf(json, sizeof(json), "{");
+    for (int i = 1; i <= KEYPAD_NUM_KEYS; i++) {
+        const char *cmd = keypad_get_key_command(i);
+        offset += snprintf(json + offset, sizeof(json) - offset,
+                           "\"%d\":\"%s\"%s", i, cmd, (i < KEYPAD_NUM_KEYS) ? "," : "");
+    }
+    snprintf(json + offset, sizeof(json) - offset, "}");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t keypad_set_handler(httpd_req_t *req) {
+    char query[128] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char key_str[16] = {0};
+        char cmd_raw[KEYPAD_CMD_MAX_LEN * 3] = {0};
+        char cmd_decoded[KEYPAD_CMD_MAX_LEN] = {0};
+
+        httpd_query_key_value(query, "key", key_str, sizeof(key_str));
+        httpd_query_key_value(query, "cmd", cmd_raw, sizeof(cmd_raw));
+
+        if (key_str[0] != '\0') {
+            url_decode(cmd_decoded, cmd_raw, sizeof(cmd_decoded));
+            int key_idx = atoi(key_str);
+            if (keypad_set_key_command(key_idx, cmd_decoded)) {
+                httpd_resp_set_type(req, "text/plain");
+                httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+                return ESP_OK;
+            }
+        }
+    }
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid key or command");
+    return ESP_FAIL;
+}
+
+static esp_err_t keypad_test_handler(httpd_req_t *req) {
+    char query[128] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char cmd_raw[KEYPAD_CMD_MAX_LEN * 3] = {0};
+        char cmd_decoded[KEYPAD_CMD_MAX_LEN] = {0};
+        if (httpd_query_key_value(query, "cmd", cmd_raw, sizeof(cmd_raw)) == ESP_OK) {
+            url_decode(cmd_decoded, cmd_raw, sizeof(cmd_decoded));
+            process_unified_command(cmd_decoded, console_print);
+            httpd_resp_set_type(req, "text/plain");
+            httpd_resp_send(req, "TRIGGERED", HTTPD_RESP_USE_STRLEN);
+            return ESP_OK;
+        }
+    }
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing cmd");
+    return ESP_FAIL;
+}
+
+static esp_err_t keypad_reset_handler(httpd_req_t *req) {
+    keypad_reset_defaults();
+    return keypad_get_handler(req);
+}
+
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 20;
+    config.max_uri_handlers = 25;
     config.lru_purge_enable = true;
 
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -904,6 +1221,32 @@ static void start_webserver(void) {
         uri.user_ctx = NULL;
         httpd_register_uri_handler(server, &uri);
 
+        // Keypad APIs
+        uri.uri = "/keypad/get";
+        uri.method = HTTP_GET;
+        uri.handler = keypad_get_handler;
+        uri.user_ctx = NULL;
+        httpd_register_uri_handler(server, &uri);
+
+        uri.uri = "/keypad/set";
+        uri.method = HTTP_GET;
+        uri.handler = keypad_set_handler;
+        uri.user_ctx = NULL;
+        httpd_register_uri_handler(server, &uri);
+
+        uri.uri = "/keypad/test";
+        uri.method = HTTP_GET;
+        uri.handler = keypad_test_handler;
+        uri.user_ctx = NULL;
+        httpd_register_uri_handler(server, &uri);
+
+        uri.uri = "/keypad/reset";
+        uri.method = HTTP_GET;
+        uri.handler = keypad_reset_handler;
+        uri.user_ctx = NULL;
+        httpd_register_uri_handler(server, &uri);
+
+        // Captive Portal Redirectors
         uri.method = HTTP_GET;
         uri.handler = captive_redirect_handler;
         uri.user_ctx = NULL;
@@ -931,7 +1274,7 @@ static void start_webserver(void) {
 
         httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, http_404_error_handler);
 
-        ESP_LOGI(TAG, "HTTP Server active on port 80 with Captive Portal redirection");
+        ESP_LOGI(TAG, "HTTP Server active on port 80 with Captive Portal & Keypad Reprogrammer");
     } else {
         ESP_LOGE(TAG, "Failed to start HTTP server!");
     }
@@ -992,12 +1335,15 @@ extern "C" void app_main(void) {
     // 4. Initialize HT517 I2S audio driver & background tasks
     audio_player_init();
 
-    // 5. Start HTTP web server with Captive Portal routes
+    // 5. Initialize 16-Key Matrix Keyboard (Rows: 13,14,15,16 | Cols: 17,18,21,38)
+    keypad_init(on_keypad_command);
+
+    // 6. Start HTTP web server with Captive Portal & Keypad Reconfiguration APIs
     start_webserver();
 
-    // 6. Initialize Bluetooth Low Energy Nordic UART Service
+    // 7. Initialize Bluetooth Low Energy Nordic UART Service
     ble_server_init(on_ble_command);
 
-    // 7. Start interactive serial console (USB Serial/JTAG + UART0)
+    // 8. Start interactive serial console (USB Serial/JTAG + UART0)
     xTaskCreate(console_read_task, "console_read_task", 4096, NULL, 5, NULL);
 }

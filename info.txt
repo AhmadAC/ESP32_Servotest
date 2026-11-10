@@ -2,7 +2,7 @@
                     YD-ESP32-S3 HARDWARE PINOUT MAPPING
 ================================================================================
 
-1. SERVO MOTOR WIRING:
+1. SERVO MOTOR WIRING (CLAW ACTUATOR):
 --------------------------------------------------------------------------------
 Servo Lead      Color (Typical)     YD-ESP32-S3 Pin     Notes
 GND             Black / Brown       GND                 Common Ground
@@ -22,19 +22,53 @@ DIO (DI0)       Bit Clock (BCLK)    GPIO 10             I2S Channel 0 Clock
 DI1             Word Select (LRC)   GPIO 11             I2S Left / Right Frame Sync
 
 
-3. BLUETOOTH LOW ENERGY (BLE) SPECIFICATION:
+3. 16-KEY MATRIX KEYBOARD WIRING (4x4 CLAW KEYPAD):
+--------------------------------------------------------------------------------
+Keypad Lead     Function            YD-ESP32-S3 Pin     Internal Config
+Row 1 (R1)      Row Scan 1          GPIO 13             Output (Active LOW)
+Row 2 (R2)      Row Scan 2          GPIO 14             Output (Active LOW)
+Row 3 (R3)      Row Scan 3          GPIO 15             Output (Active LOW)
+Row 4 (R4)      Row Scan 4          GPIO 16             Output (Active LOW)
+Col 1 (C1)      Column Read 1       GPIO 17             Input (Internal Pull-Up)
+Col 2 (C2)      Column Read 2       GPIO 18             Input (Internal Pull-Up)
+Col 3 (C3)      Column Read 3       GPIO 21             Input (Internal Pull-Up)
+Col 4 (C4)      Column Read 4       GPIO 38             Input (Internal Pull-Up)
+
+Matrix Key Coordinates and Factory Defaults:
+- Key 1  (R1C1): '0'         -> Close Claw Completely (0 deg)
+- Key 2  (R1C2): '45'        -> Claw Quarter Open (45 deg)
+- Key 3  (R1C3): '90'        -> Claw Half Open / Neutral (90 deg)
+- Key 4  (R1C4): '180'       -> Open Claw Completely (180 deg)
+- Key 5  (R2C1): 'nudge -10' -> Nudge Claw Closed by 10 deg
+- Key 6  (R2C2): '135'       -> Claw 3/4 Open (135 deg)
+- Key 7  (R2C3): 'nudge +10' -> Nudge Claw Open by 10 deg
+- Key 8  (R2C4): 'bark'      -> Play Dog Bark Sound
+- Key 9  (R3C1): 'nudge -2'  -> Fine-step Nudge Claw Closed by 2 deg
+- Key 10 (R3C2): 'beep'      -> Play Diagnostic Test Tone
+- Key 11 (R3C3): 'nudge +2'  -> Fine-step Nudge Claw Open by 2 deg
+- Key 12 (R3C4): 'stop'      -> Stop Audio Playback
+- Key 13 (R4C1): 'vol -10'   -> Decrease Volume by 10%
+- Key 14 (R4C2): 'vol 50'    -> Set Volume to 50%
+- Key 15 (R4C3): 'vol +10'   -> Increase Volume by 10%
+- Key 16 (R4C4): 'status'    -> Print Device Status
+
+* Note: Keys can be dynamically customized and saved to NVS via http://192.168.4.1/
+
+
+4. BLUETOOTH LOW ENERGY (BLE) SPECIFICATION:
 --------------------------------------------------------------------------------
 Device Advertised Name:     ESP32S3-Servo
 GATT Service (NUS):         6e400001-b5a3-f393-e0a9-e50e24dcca9e
 RX Characteristic (Write):  6e400002-b5a3-f393-e0a9-e50e24dcca9e
 TX Characteristic (Notify): 6e400003-b5a3-f393-e0a9-e50e24dcca9e
 
-Text Commands Accepted over BLE:
-- '0' through '180' (or 'angle <deg>') : Adjust servo position
+Text Commands Accepted over BLE, Serial, Web, and Keypad:
+- '0' through '180' (or 'angle <deg>') : Adjust servo position directly
+- 'nudge <+/-deg>' (e.g. 'nudge -5')   : Increment or decrement claw position
 - 'bark'                               : Play embedded dog bark audio
 - 'beep'                               : Play diagnostic test tone
 - 'stop'                               : Stop audio playback
-- 'vol <0-100>'                        : Set speaker volume
+- 'vol <0-100>' or 'vol <+/-val>'      : Set or adjust speaker volume
 - 'pins <bclk> <lrc> <din>'            : Dynamically reassign I2S pins
 - 'status'                             : Query angles, volume, and pins
-===============================================================================
+================================================================================
