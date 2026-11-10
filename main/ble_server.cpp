@@ -39,6 +39,10 @@ static void ble_reply_fn(const char *reply) {
 
 static int gatt_svr_chr_access_rx(uint16_t conn_handle, uint16_t attr_handle,
                                    struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    (void)conn_handle;
+    (void)attr_handle;
+    (void)arg;
+
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
         uint16_t om_len = OS_MBUF_PKTLEN(ctxt->om);
         char buf[128];
@@ -63,32 +67,64 @@ static int gatt_svr_chr_access_rx(uint16_t conn_handle, uint16_t attr_handle,
 
 static int gatt_svr_chr_access_tx(uint16_t conn_handle, uint16_t attr_handle,
                                    struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    (void)conn_handle;
+    (void)attr_handle;
+    (void)ctxt;
+    (void)arg;
     return 0;
 }
+
+// Characteristic definitions in strict struct member declaration order
+static const struct ble_gatt_chr_def gatt_svr_chrs[] = {
+    {
+        .uuid = &gatt_svr_chr_rx_uuid.u,
+        .access_cb = gatt_svr_chr_access_rx,
+        .arg = NULL,
+        .descriptors = NULL,
+        .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+        .min_key_size = 0,
+        .val_handle = NULL,
+        .cpfd = NULL,
+    },
+    {
+        .uuid = &gatt_svr_chr_tx_uuid.u,
+        .access_cb = gatt_svr_chr_access_tx,
+        .arg = NULL,
+        .descriptors = NULL,
+        .flags = BLE_GATT_CHR_F_NOTIFY,
+        .min_key_size = 0,
+        .val_handle = &s_tx_val_handle,
+        .cpfd = NULL,
+    },
+    {
+        .uuid = NULL,
+        .access_cb = NULL,
+        .arg = NULL,
+        .descriptors = NULL,
+        .flags = 0,
+        .min_key_size = 0,
+        .val_handle = NULL,
+        .cpfd = NULL,
+    }
+};
 
 static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
         .uuid = &gatt_svr_svc_uart_uuid.u,
-        .characteristics = (struct ble_gatt_chr_def[]) {
-            {
-                .uuid = &gatt_svr_chr_rx_uuid.u,
-                .access_cb = gatt_svr_chr_access_rx,
-                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
-            },
-            {
-                .uuid = &gatt_svr_chr_tx_uuid.u,
-                .val_handle = &s_tx_val_handle,
-                .access_cb = gatt_svr_chr_access_tx,
-                .flags = BLE_GATT_CHR_F_NOTIFY,
-            },
-            { 0 }
-        },
+        .includes = NULL,
+        .characteristics = gatt_svr_chrs,
     },
-    { 0 }
+    {
+        .type = 0,
+        .uuid = NULL,
+        .includes = NULL,
+        .characteristics = NULL,
+    }
 };
 
 static int ble_gap_event(struct ble_gap_event *event, void *arg) {
+    (void)arg;
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         ESP_LOGI(TAG, "BLE Connection %s (status=%d)",
@@ -158,6 +194,7 @@ static void ble_advertise(void) {
 }
 
 static void ble_host_task(void *param) {
+    (void)param;
     ESP_LOGI(TAG, "NimBLE host task started");
     nimble_port_run();
     nimble_port_freertos_deinit();
