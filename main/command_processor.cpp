@@ -1,0 +1,226 @@
+#include "command_processor.h"
+#include "servo_controller.h"
+#include "audio_player.h"
+#include "ble_server.h"
+#include "keypad.h"
+#include "console_serial.h"
+#include "esp_system.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+
+static const char *TAG = "CMD_PROC";
+
+void command_notify_status(void) {
+    if (!ble_server_is_connected()) return;
+
+    int bclk = 10, lrc = 11, din = 12;
+    audio_get_pins(&bclk, &lrc, &din);
+
+    char status_str[128];
+    snprintf(status_str, sizeof(status_str),
+             "STATUS:angle=%d,vol=%d,bclk=%d,lrc=%d,din=%d\n",
+             servo_get_angle(), audio_get_volume(), bclk, lrc, din);
+    ble_server_send_notify(status_str);
+}
+
+void command_process(const char *cmd_line, command_print_fn_t print_fn) {
+    if (!cmd_line || !print_fn) return;
+
+    const char *p = cmd_line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0') return;
+
+    // Direct integer angle (e.g. "90")
+    bool is_numeric = true;
+    int p_len = strlen(p);
+    for (int j = 0; j < p_len; j++) {
+        if (!isdigit((unsigned char)p[j])) {
+            is_numeric = false;
+            break;
+        }
+    }
+
+    if (is_numeric) {
+        int req_angle = atoi(p);
+        if (req_angle >= 0 && req_angle <= 180) {
+            servo_set_angle(req_angle);
+            char msg[64];
+            snprintf(msg, sizeof(msg), ">> Servo moved to %d deg\n", req_angle);
+            print_fn(msg);
+            command_notify_status();
+        } else {
+            print_fn(">> Error: Angle must be between 0 and 180 degrees.\n");
+        }
+        return;
+    }
+
+    // Relative claw nudging: "nudge <+/-deg>" or "+5" or "-10"
+    if (strncmp(p, "nudge ", 6) == 0 ||
+        ((p[0] == '+' || p[0] == '-') && isdigit((unsigned char)p[1]))) {
+        int delta = (strncmp(p, "nudge ", 6) == 0) ? atoi(p + 6) : atoi(p);
+        int target = servo_get_angle() + delta;
+        if (target < 0) target = 0;
+        if (target > 180) target = 180;
+        servo_set_angle(target);
+        char msg[64];
+        snprintf(msg, sizeof(msg), ">> Servo nudged by %+d -> %d deg\n", delta, target);
+        print_fn(msg);
+        command_notify_status();
+        return;
+    }
+
+    // Reprogramming 16 Matrix Keyboard: "key <1-16> <command...>"
+    if (strncmp(p, "key ", 4) == 0 || strncmp(p, "setkey ", 7) == 0) {
+        const char *arg = (strncmp(p, "key ", 4) == 0) ? (p + 4) : (p + 7);
+        while (*arg == ' ') arg++;
+        char *endptr = NULL;
+        long key_num = strtol(arg, &endptr, 10);
+        if (key_num >= 1 && key_num <= KEYPAD_NUM_KEYS && endptr != NULL && *endptr != '\0') {
+            while (*endptr == ' ' || *endptr == '\t') endptr++;
+            if (*endptr != '\0') {
+                keypad_set_key_command((int)key_num, endptr);
+
+                char confirm[96];
+                snprintf(confirm, sizeof(confirm), "KEY:%ld=%s\n", key_num, endptr);
+                ble_server_send_notify(confirm);
+
+                char msg[96];
+                snprintf(msg, sizeof(msg), ">> Key %ld mapped to '%s' (NVS Flash)\n", key_num, endptr);
+                print_fn(msg);
+                return;
+            }
+        }
+        print_fn(">> Usage: key <1-16> <command> (e.g. 'key 1 0' or 'key 8 bark')\n");
+        return;
+    }
+
+    // Query all keys over BLE / Serial: "getkeys"
+    if (strcmp(p, "getkeys") == 0 || strcmp(p, "keys") == 0) {
+        for (int i = 1; i <= KEYPAD_NUM_KEYS; i++) {
+            const char *kcmd = keypad_get_key_command(i);
+            char line[96];
+            snprintf(line, sizeof(line), "KEY:%d=%s\n", i, kcmd);
+            ble_server_send_notify(line);
+            print_fn(line);
+            vTaskDelay(pdMS_TO_TICKS(15));
+        }
+        return;
+    }
+
+    // Reset keypad to factory defaults: "keyreset"
+    if (strcmp(p, "keyreset") == 0) {
+        keypad_reset_defaults();
+        for (int i = 1; i <= KEYPAD_NUM_KEYS; i++) {
+            const char *kcmd = keypad_get_key_command(i);
+            char line[96];
+            snprintf(line, sizeof(line), "KEY:%d=%s\n", i, kcmd);
+            ble_server_send_notify(line);
+            vTaskDelay(pdMS_TO_TICKS(15));
+        }
+        print_fn(">> Keypad reset to defaults.\n");
+        return;
+    }
+
+    if (strncmp(p, "angle ", 6) == 0) {
+        int req_angle = atoi(p + 6);
+        if (req_angle >= 0 && req_angle <= 180) {
+            servo_set_angle(req_angle);
+            char msg[64];
+            snprintf(msg, sizeof(msg), ">> Servo moved to %d deg\n", req_angle);
+            print_fn(msg);
+            command_notify_status();
+        } else {
+            print_fn(">> Error: Angle must be between 0 and 180 degrees.\n");
+        }
+    } else if (strcmp(p, "bark") == 0 || strcmp(p, "play") == 0 || strcmp(p, "sound") == 0) {
+        audio_play("dog_bark");
+        char msg[64];
+        snprintf(msg, sizeof(msg), ">> Playing dog bark on HT517 (Volume: %d%%)\n", audio_get_volume());
+        print_fn(msg);
+    } else if (strcmp(p, "beep") == 0 || strcmp(p, "test") == 0) {
+        audio_play_test_beep();
+        print_fn(">> Playing test beep chime on HT517 speaker...\n");
+    } else if (strcmp(p, "stop") == 0) {
+        audio_stop();
+        print_fn(">> Audio playback stopped.\n");
+    } else if (strncmp(p, "vol ", 4) == 0 || strncmp(p, "volume ", 7) == 0) {
+        const char *v_str = (strncmp(p, "vol ", 4) == 0) ? (p + 4) : (p + 7);
+        while (*v_str == ' ') v_str++;
+        int target_vol = 0;
+        if (v_str[0] == '+' || v_str[0] == '-') {
+            target_vol = audio_get_volume() + atoi(v_str);
+        } else {
+            target_vol = atoi(v_str);
+        }
+        if (target_vol < 0) target_vol = 0;
+        if (target_vol > 100) target_vol = 100;
+        audio_set_volume(target_vol);
+        char msg[64];
+        snprintf(msg, sizeof(msg), ">> Speaker volume set to %d%%\n", target_vol);
+        print_fn(msg);
+        command_notify_status();
+    } else if (strncmp(p, "pins ", 5) == 0) {
+        int b = 0, l = 0, d = 0;
+        if (sscanf(p + 5, "%d %d %d", &b, &l, &d) == 3) {
+            audio_set_pins(b, l, d);
+            char msg[64];
+            snprintf(msg, sizeof(msg), ">> Audio pins updated: BCLK=%d, LRC=%d, DIN=%d\n", b, l, d);
+            print_fn(msg);
+            command_notify_status();
+        } else {
+            print_fn(">> Usage: pins <bclk> <lrc> <din> (e.g. 'pins 10 11 12')\n");
+        }
+    } else if (strcmp(p, "status") == 0) {
+        int bclk = 10, lrc = 11, din = 12;
+        audio_get_pins(&bclk, &lrc, &din);
+        char msg[140];
+        snprintf(msg, sizeof(msg),
+                 ">> Servo: %d deg | Vol: %d%% | Pins: BCLK=%d LRC=%d DIN=%d | BLE: %s | Web: http://192.168.4.1/\n",
+                 servo_get_angle(), audio_get_volume(), bclk, lrc, din,
+                 ble_server_is_connected() ? "Connected" : "Advertising");
+        print_fn(msg);
+        command_notify_status();
+    } else if (strcmp(p, "help") == 0 || strcmp(p, "?") == 0) {
+        print_fn("Available Commands:\n"
+                 "  0 - 180          : Move servo angle directly\n"
+                 "  angle <0-180>    : Move servo angle\n"
+                 "  nudge <+/-deg>   : Nudge angle (e.g. 'nudge +10', '-5')\n"
+                 "  key <1-16> <cmd> : Reprogram key and save to NVS flash\n"
+                 "  getkeys          : Read all 16 key actions over BLE\n"
+                 "  keyreset         : Restore factory defaults on keypad\n"
+                 "  bark / play      : Play dog bark sound\n"
+                 "  beep / test      : Play diagnostic tone\n"
+                 "  stop             : Stop speaker playback\n"
+                 "  vol <0-100>      : Set volume (or 'vol +10', 'vol -10')\n"
+                 "  pins 10 11 12    : Preset 1 (YD Default)\n"
+                 "  pins 8 7 9       : Preset 2 (Seeed)\n"
+                 "  pins 12 11 10    : Preset 3 (Swapped)\n"
+                 "  status           : Show device status\n"
+                 "  reboot / restart : Restart ESP32-S3\n");
+    } else if (strcmp(p, "reboot") == 0 || strcmp(p, "restart") == 0) {
+        print_fn("Rebooting ESP32-S3...\n");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_restart();
+    } else {
+        char err_msg[64];
+        snprintf(err_msg, sizeof(err_msg), ">> Unknown command: '%s'. Enter 'help'.\n", p);
+        print_fn(err_msg);
+    }
+}
+
+void command_on_ble_received(const char *cmd, void (*reply_fn)(const char *reply)) {
+    ESP_LOGI(TAG, "BLE Command: '%s'", cmd);
+    command_process(cmd, reply_fn);
+}
+
+void command_on_keypad_received(const char *cmd) {
+    char log_buf[64];
+    snprintf(log_buf, sizeof(log_buf), "\n[Matrix Keypad Action] -> '%s'\n", cmd);
+    console_print(log_buf);
+    command_process(cmd, console_print);
+}

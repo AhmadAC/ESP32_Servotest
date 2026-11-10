@@ -15,7 +15,16 @@ else()
 endif()
 
 idf_component_register(
-    SRCS "main.cpp" "audio_player.cpp" "ble_server.cpp" "keypad.cpp"
+    SRCS
+        "main.cpp"
+        "servo_controller.cpp"
+        "command_processor.cpp"
+        "wifi_manager.cpp"
+        "console_serial.cpp"
+        "web_server.cpp"
+        "audio_player.cpp"
+        "ble_server.cpp"
+        "keypad.cpp"
     INCLUDE_DIRS "."
     REQUIRES esp_http_server esp_wifi esp_netif nvs_flash driver esp_timer lwip bt
     EMBED_FILES "${AUDIO_FILE}"
