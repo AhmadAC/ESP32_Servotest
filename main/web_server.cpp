@@ -106,12 +106,35 @@ static esp_err_t set_angle_handler(httpd_req_t *req) {
 static esp_err_t get_status_handler(httpd_req_t *req) {
     int bclk = 10, lrc = 11, din = 12;
     audio_get_pins(&bclk, &lrc, &din);
-    char json_resp[128];
+    char json_resp[160];
     snprintf(json_resp, sizeof(json_resp),
-             "{\"angle\":%d,\"volume\":%d,\"bclk\":%d,\"lrc\":%d,\"din\":%d}",
-             servo_get_angle(), audio_get_volume(), bclk, lrc, din);
+             "{\"angle\":%d,\"volume\":%d,\"bclk\":%d,\"lrc\":%d,\"din\":%d,\"autoretract\":%d}",
+             servo_get_angle(), audio_get_volume(), bclk, lrc, din,
+             command_get_auto_retract() ? 1 : 0);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json_resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t autoretract_handler(httpd_req_t *req) {
+    char query[64] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[16] = {0};
+        if (httpd_query_key_value(query, "val", val, sizeof(val)) == ESP_OK ||
+            httpd_query_key_value(query, "enable", val, sizeof(val)) == ESP_OK) {
+            bool en = (atoi(val) != 0 || strcmp(val, "on") == 0 || strcmp(val, "true") == 0);
+            command_set_auto_retract(en);
+            char resp[32];
+            snprintf(resp, sizeof(resp), "OK %d", en ? 1 : 0);
+            httpd_resp_set_type(req, "text/plain");
+            httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+            return ESP_OK;
+        }
+    }
+    char resp[32];
+    snprintf(resp, sizeof(resp), "{\"autoretract\":%d}", command_get_auto_retract() ? 1 : 0);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -233,7 +256,7 @@ static esp_err_t keypad_reset_handler(httpd_req_t *req) {
 void web_server_init(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 25;
+    config.max_uri_handlers = 26;
     config.lru_purge_enable = true;
 
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -254,6 +277,12 @@ void web_server_init(void) {
         uri.uri = "/get";
         uri.method = HTTP_GET;
         uri.handler = get_status_handler;
+        uri.user_ctx = NULL;
+        httpd_register_uri_handler(server, &uri);
+
+        uri.uri = "/autoretract";
+        uri.method = HTTP_GET;
+        uri.handler = autoretract_handler;
         uri.user_ctx = NULL;
         httpd_register_uri_handler(server, &uri);
 

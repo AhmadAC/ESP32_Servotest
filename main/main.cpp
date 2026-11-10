@@ -23,25 +23,28 @@ extern "C" void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // 2. Wi-Fi Soft-AP & Captive DNS (UDP 53)
+    // 2. Command Processor Subsystem (Loads Auto-Retract Settings)
+    command_processor_init();
+
+    // 3. Wi-Fi Soft-AP & Captive DNS (UDP 53)
     wifi_manager_init();
 
-    // 3. Servo Actuator (LEDC PWM GPIO 4)
+    // 4. Servo Actuator (LEDC PWM GPIO 4)
     servo_controller_init();
 
-    // 4. Audio Engine (I2S Speaker & PDM Mic)
+    // 5. Audio Engine (I2S Speaker & PDM Mic)
     audio_player_init();
 
-    // 5. 16-Matrix Keyboard Scanner (Rows: 13,14,15,16 | Cols: 17,18,21,38)
-    keypad_init(command_on_keypad_received);
+    // 6. 16-Matrix Keyboard Scanner (with Hold & Release Edge Detection)
+    keypad_init(command_on_keypad_event);
 
-    // 6. HTTP Web Server & Dashboard
+    // 7. HTTP Web Server & Dashboard
     web_server_init();
 
-    // 7. Bluetooth Low Energy NUS Engine
+    // 8. Bluetooth Low Energy NUS Engine
     ble_server_init(command_on_ble_received);
 
-    // 8. Serial Console (UART0 & Native USB-Serial-JTAG REPL)
+    // 9. Serial Console (UART0 & Native USB-Serial-JTAG REPL)
     console_serial_init();
 
     ESP_LOGI(TAG, "All subsystems running. System ready for commands.");

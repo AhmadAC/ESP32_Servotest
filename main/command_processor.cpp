@@ -6,6 +6,8 @@
 #include "console_serial.h"
 #include "esp_system.h"
 #include "esp_log.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdio.h>
@@ -15,16 +17,54 @@
 
 static const char *TAG = "CMD_PROC";
 
+static bool s_auto_retract_enabled = true;
+static int s_active_open_key = -1;
+
+void command_processor_init(void) {
+    nvs_handle_t handle;
+    if (nvs_open("storage", NVS_READONLY, &handle) == ESP_OK) {
+        uint8_t val = 1;
+        if (nvs_get_u8(handle, "auto_retract", &val) == ESP_OK) {
+            s_auto_retract_enabled = (val != 0);
+        }
+        nvs_close(handle);
+    }
+    ESP_LOGI(TAG, "Command Processor Initialized (Matrix Auto-Retract: %s)",
+             s_auto_retract_enabled ? "ON" : "OFF");
+}
+
+void command_set_auto_retract(bool enable) {
+    s_auto_retract_enabled = enable;
+    nvs_handle_t handle;
+    if (nvs_open("storage", NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_u8(handle, "auto_retract", enable ? 1 : 0);
+        nvs_commit(handle);
+        nvs_close(handle);
+    }
+
+    char ble_resp[32];
+    snprintf(ble_resp, sizeof(ble_resp), "AUTORETRACT:%s\n", enable ? "ON" : "OFF");
+    ble_server_send_notify(ble_resp);
+
+    command_notify_status();
+    ESP_LOGI(TAG, "Matrix Auto-Retract set to %s (Saved to Flash)", enable ? "ON" : "OFF");
+}
+
+bool command_get_auto_retract(void) {
+    return s_auto_retract_enabled;
+}
+
 void command_notify_status(void) {
     if (!ble_server_is_connected()) return;
 
     int bclk = 10, lrc = 11, din = 12;
     audio_get_pins(&bclk, &lrc, &din);
 
-    char status_str[128];
+    char status_str[160];
     snprintf(status_str, sizeof(status_str),
-             "STATUS:angle=%d,vol=%d,bclk=%d,lrc=%d,din=%d\n",
-             servo_get_angle(), audio_get_volume(), bclk, lrc, din);
+             "STATUS:angle=%d,vol=%d,bclk=%d,lrc=%d,din=%d,retract=%d\n",
+             servo_get_angle(), audio_get_volume(), bclk, lrc, din,
+             s_auto_retract_enabled ? 1 : 0);
     ble_server_send_notify(status_str);
 }
 
@@ -72,6 +112,34 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
         print_fn(msg);
         command_notify_status();
         return;
+    }
+
+    // Auto-Retract Toggle Commands: "autoretract on", "autoretract off", "autoretract toggle"
+    if (strncmp(p, "autoretract", 11) == 0) {
+        const char *arg = p + 11;
+        while (*arg == ' ') arg++;
+        if (strcmp(arg, "on") == 0 || strcmp(arg, "1") == 0 || strcmp(arg, "true") == 0) {
+            command_set_auto_retract(true);
+            print_fn(">> Matrix Auto-Retract: ON\n");
+            return;
+        } else if (strcmp(arg, "off") == 0 || strcmp(arg, "0") == 0 || strcmp(arg, "false") == 0) {
+            command_set_auto_retract(false);
+            print_fn(">> Matrix Auto-Retract: OFF\n");
+            return;
+        } else if (strcmp(arg, "toggle") == 0) {
+            command_set_auto_retract(!s_auto_retract_enabled);
+            char msg[64];
+            snprintf(msg, sizeof(msg), ">> Matrix Auto-Retract toggled to: %s\n",
+                     s_auto_retract_enabled ? "ON" : "OFF");
+            print_fn(msg);
+            return;
+        } else {
+            char msg[64];
+            snprintf(msg, sizeof(msg), ">> Matrix Auto-Retract currently: %s\n",
+                     s_auto_retract_enabled ? "ON" : "OFF");
+            print_fn(msg);
+            return;
+        }
     }
 
     // Reprogramming 16 Matrix Keyboard: "key <1-16> <command...>"
@@ -178,10 +246,12 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
     } else if (strcmp(p, "status") == 0) {
         int bclk = 10, lrc = 11, din = 12;
         audio_get_pins(&bclk, &lrc, &din);
-        char msg[140];
+        char msg[160];
         snprintf(msg, sizeof(msg),
-                 ">> Servo: %d deg | Vol: %d%% | Pins: BCLK=%d LRC=%d DIN=%d | BLE: %s | Web: http://192.168.4.1/\n",
-                 servo_get_angle(), audio_get_volume(), bclk, lrc, din,
+                 ">> Servo: %d deg | Vol: %d%% | Auto-Retract: %s | Pins: %d,%d,%d | BLE: %s\n",
+                 servo_get_angle(), audio_get_volume(),
+                 s_auto_retract_enabled ? "ON" : "OFF",
+                 bclk, lrc, din,
                  ble_server_is_connected() ? "Connected" : "Advertising");
         print_fn(msg);
         command_notify_status();
@@ -190,6 +260,7 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
                  "  0 - 180          : Move servo angle directly\n"
                  "  angle <0-180>    : Move servo angle\n"
                  "  nudge <+/-deg>   : Nudge angle (e.g. 'nudge +10', '-5')\n"
+                 "  autoretract <on/off/toggle> : Hold-to-open matrix retract mode\n"
                  "  key <1-16> <cmd> : Reprogram key and save to NVS flash\n"
                  "  getkeys          : Read all 16 key actions over BLE\n"
                  "  keyreset         : Restore factory defaults on keypad\n"
@@ -198,8 +269,6 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
                  "  stop             : Stop speaker playback\n"
                  "  vol <0-100>      : Set volume (or 'vol +10', 'vol -10')\n"
                  "  pins 10 11 12    : Preset 1 (YD Default)\n"
-                 "  pins 8 7 9       : Preset 2 (Seeed)\n"
-                 "  pins 12 11 10    : Preset 3 (Swapped)\n"
                  "  status           : Show device status\n"
                  "  reboot / restart : Restart ESP32-S3\n");
     } else if (strcmp(p, "reboot") == 0 || strcmp(p, "restart") == 0) {
@@ -218,9 +287,55 @@ void command_on_ble_received(const char *cmd, void (*reply_fn)(const char *reply
     command_process(cmd, reply_fn);
 }
 
-void command_on_keypad_received(const char *cmd) {
-    char log_buf[64];
-    snprintf(log_buf, sizeof(log_buf), "\n[Matrix Keypad Action] -> '%s'\n", cmd);
-    console_print(log_buf);
-    command_process(cmd, console_print);
+// Handles physical press and release events from the 16-key matrix keyboard
+void command_on_keypad_event(int key_index, const char *cmd, bool is_pressed) {
+    if (is_pressed) {
+        char log_buf[80];
+        snprintf(log_buf, sizeof(log_buf), "\n[Matrix Keypad Action] -> Pressed Key %d ('%s')\n", key_index, cmd);
+        console_print(log_buf);
+
+        // Check if this command opens the claw
+        int target_angle = -1;
+        const char *p = cmd;
+        while (*p == ' ') p++;
+
+        bool is_num = true;
+        for (int i = 0; p[i] != '\0'; i++) {
+            if (!isdigit((unsigned char)p[i])) { is_num = false; break; }
+        }
+
+        if (is_num) {
+            target_angle = atoi(p);
+        } else if (strncmp(p, "angle ", 6) == 0) {
+            target_angle = atoi(p + 6);
+        } else if (strncmp(p, "nudge +", 7) == 0 || (p[0] == '+' && isdigit((unsigned char)p[1]))) {
+            target_angle = servo_get_angle() + atoi(p[0] == '+' ? p : p + 6);
+        }
+
+        if (target_angle > 0) {
+            s_active_open_key = key_index;
+        } else if (target_angle == 0) {
+            s_active_open_key = -1;
+        }
+
+        // Execute the command: claw moves to commanded angle and holds as long as pressed
+        command_process(cmd, console_print);
+
+    } else {
+        // BUTTON RELEASED:
+        char log_buf[64];
+        snprintf(log_buf, sizeof(log_buf), "\n[Matrix Keypad Action] -> Released Key %d\n", key_index);
+        console_print(log_buf);
+
+        if (s_auto_retract_enabled) {
+            // If the key that opened/nudged the claw was let go, immediately snap back to 0°
+            if (s_active_open_key == key_index || (s_active_open_key == -1 && servo_get_angle() > 0)) {
+                s_active_open_key = -1;
+                servo_set_angle(0);
+                command_notify_status();
+                console_print(">> Auto-Retract triggered on release: Claw snapped to 0 deg\n");
+                ble_server_send_notify("AUTORETRACT:RETRACTED\n");
+            }
+        }
+    }
 }

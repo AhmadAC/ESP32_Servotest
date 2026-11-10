@@ -48,7 +48,7 @@ static const char *DEFAULT_COMMANDS[KEYPAD_NUM_KEYS] = {
 };
 
 static char s_commands[KEYPAD_NUM_KEYS][KEYPAD_CMD_MAX_LEN];
-static keypad_cmd_callback_t s_callback = NULL;
+static keypad_event_callback_t s_event_callback = NULL;
 
 static void keypad_load_nvs(void) {
     nvs_handle_t my_handle;
@@ -137,38 +137,54 @@ void keypad_reset_defaults(void) {
 
 static void keypad_scan_task(void *pvParameters) {
     uint8_t press_count[KEYPAD_NUM_KEYS] = {0};
+    uint8_t release_count[KEYPAD_NUM_KEYS] = {0};
     bool key_active[KEYPAD_NUM_KEYS] = {false};
     const uint8_t DEBOUNCE_THRESHOLD = 2; // ~30ms debounce
 
     while (1) {
         for (int r = 0; r < 4; r++) {
-            // Drive the target row LOW
+            // Drive current row LOW
             gpio_set_level(ROW_PINS[r], 0);
             esp_rom_delay_us(15);
 
             for (int c = 0; c < 4; c++) {
                 int key_idx = (r * 4) + c;
                 int level = gpio_get_level(COL_PINS[c]);
-                bool is_down = (level == 0); // Active LOW due to pull-up
+                bool is_down = (level == 0); // Active LOW due to internal pull-up
 
                 if (is_down) {
+                    release_count[key_idx] = 0;
                     if (press_count[key_idx] < DEBOUNCE_THRESHOLD) {
                         press_count[key_idx]++;
                         if (press_count[key_idx] >= DEBOUNCE_THRESHOLD && !key_active[key_idx]) {
                             key_active[key_idx] = true;
-                            ESP_LOGI(TAG, "Key %d Pressed -> Dispatching: '%s'", key_idx + 1, s_commands[key_idx]);
-                            if (s_callback != NULL && strlen(s_commands[key_idx]) > 0) {
-                                s_callback(s_commands[key_idx]);
+                            ESP_LOGI(TAG, "Key %d Pressed -> '%s'", key_idx + 1, s_commands[key_idx]);
+                            if (s_event_callback != NULL && strlen(s_commands[key_idx]) > 0) {
+                                s_event_callback(key_idx + 1, s_commands[key_idx], true);
                             }
                         }
                     }
                 } else {
                     press_count[key_idx] = 0;
-                    key_active[key_idx] = false;
+                    if (key_active[key_idx]) {
+                        if (release_count[key_idx] < DEBOUNCE_THRESHOLD) {
+                            release_count[key_idx]++;
+                            if (release_count[key_idx] >= DEBOUNCE_THRESHOLD) {
+                                key_active[key_idx] = false;
+                                release_count[key_idx] = 0;
+                                ESP_LOGI(TAG, "Key %d Released -> '%s'", key_idx + 1, s_commands[key_idx]);
+                                if (s_event_callback != NULL && strlen(s_commands[key_idx]) > 0) {
+                                    s_event_callback(key_idx + 1, s_commands[key_idx], false);
+                                }
+                            }
+                        }
+                    } else {
+                        release_count[key_idx] = 0;
+                    }
                 }
             }
 
-            // Restore the row to HIGH
+            // Restore row HIGH
             gpio_set_level(ROW_PINS[r], 1);
         }
 
@@ -176,8 +192,8 @@ static void keypad_scan_task(void *pvParameters) {
     }
 }
 
-void keypad_init(keypad_cmd_callback_t callback) {
-    s_callback = callback;
+void keypad_init(keypad_event_callback_t callback) {
+    s_event_callback = callback;
     keypad_load_nvs();
 
     // 1. Configure Row pins as Outputs
