@@ -22,7 +22,27 @@ DIO (DI0)       Bit Clock (BCLK)    GPIO 10             I2S Channel 0 Clock
 DI1             Word Select (LRC)   GPIO 11             I2S Left / Right Frame Sync
 
 
-3. 16-KEY MATRIX KEYBOARD WIRING (4x4 CLAW KEYPAD):
+3. PS2 JOYSTICK & BUTTON MODULE WIRING (ANALOG GAMEPAD BREAKOUT):
+--------------------------------------------------------------------------------
+Joystick Pin    Function            YD-ESP32-S3 Pin     Internal Config
+VCC             Supply (3.3V/5V)    3.3V (Recommended)  Potentiometer reference
+GND             Ground              GND                 Common Ground
+VRX             X-Axis Potentiometer GPIO 1              ADC1 Channel 0 (Claw Angle 0-180 deg)
+VRY             Y-Axis Potentiometer GPIO 2              ADC1 Channel 1 (Pitch / Fine Adjust)
+SW              Joystick Push Key   GPIO 3              Input with Internal Pull-Up (Auto-Retract Toggle)
+K1 (Red)        Tactile Button 1    GPIO 5              Input with Internal Pull-Up (Open 180 deg)
+K2 (Green)      Tactile Button 2    GPIO 6              Input with Internal Pull-Up (Center 90 deg)
+K3 (Blue)       Tactile Button 3    GPIO 7              Input with Internal Pull-Up (Bark Sound)
+K4 (Yellow)     Tactile Button 4    GPIO 8              Input with Internal Pull-Up (Test Beep Tone)
+
+* Operation:
+- Moving VRX smoothly controls the claw position from 0 to 180 degrees.
+- When Auto-Retract is ON, releasing the joystick back to center snaps the claw to 0 degrees.
+- Pressing SW toggles Auto-Retract on/off.
+- The 4 tactile buttons provide instantaneous one-touch control with hold-to-open capability.
+
+
+4. 16-KEY MATRIX KEYBOARD WIRING (4x4 CLAW KEYPAD):
 --------------------------------------------------------------------------------
 Keypad Lead     Function            YD-ESP32-S3 Pin     Internal Config
 Row 1 (R1)      Row Scan 1          GPIO 13             Output (Active LOW)
@@ -52,19 +72,18 @@ Matrix Key Coordinates and Factory Defaults:
 - Key 15 (R4C3): 'vol +10'   -> Increase Volume by 10%
 - Key 16 (R4C4): 'status'    -> Print Device Status
 
-* Note: Keys can be dynamically customized and saved to NVS via http://192.168.4.1/
 
-
-4. BLUETOOTH LOW ENERGY (BLE) SPECIFICATION:
+5. BLUETOOTH LOW ENERGY (BLE) SPECIFICATION:
 --------------------------------------------------------------------------------
 Device Advertised Name:     ESP32S3-Servo
 GATT Service (NUS):         6e400001-b5a3-f393-e0a9-e50e24dcca9e
 RX Characteristic (Write):  6e400002-b5a3-f393-e0a9-e50e24dcca9e
 TX Characteristic (Notify): 6e400003-b5a3-f393-e0a9-e50e24dcca9e
 
-Text Commands Accepted over BLE, Serial, Web, and Keypad:
+Text Commands Accepted over BLE, Serial, Web, Joystick, and Keypad:
 - '0' through '180' (or 'angle <deg>') : Adjust servo position directly
 - 'nudge <+/-deg>' (e.g. 'nudge -5')   : Increment or decrement claw position
+- 'autoretract <on/off/toggle>'        : Toggle hold-and-snap-to-zero mode
 - 'bark'                               : Play embedded dog bark audio
 - 'beep'                               : Play diagnostic test tone
 - 'stop'                               : Stop audio playback

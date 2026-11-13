@@ -25,7 +25,8 @@ idf_component_register(
         "audio_player.cpp"
         "ble_server.cpp"
         "keypad.cpp"
+        "joystick.cpp"
     INCLUDE_DIRS "."
-    REQUIRES esp_http_server esp_wifi esp_netif nvs_flash driver esp_timer lwip bt
+    REQUIRES esp_http_server esp_wifi esp_netif nvs_flash driver esp_timer lwip bt esp_adc
     EMBED_FILES "${AUDIO_FILE}"
 )

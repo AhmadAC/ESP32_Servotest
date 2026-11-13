@@ -13,32 +13,27 @@
 static const char *TAG = "WEB_SERVER";
 static httpd_handle_t server = NULL;
 
+// Lightweight minimal diagnostic page (WebLauncher app runs independently)
 static const char INDEX_HTML[] = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>YD-ESP32-S3 Claw Controller</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32-S3 Claw Controller API</title>
     <style>
-        :root { --bg: #020617; --card: #0f172a; --primary: #38bdf8; --accent: #10b981; }
-        body { background: var(--bg); color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; justify-content: center; padding: 16px; margin: 0; }
-        .box { background: var(--card); border: 1px solid #334155; border-radius: 16px; padding: 20px; width: 100%; max-width: 440px; text-align: center; }
-        h1 { font-size: 1.25rem; color: var(--primary); margin-bottom: 6px; }
-        p { font-size: 0.8rem; color: #94a3b8; margin-bottom: 16px; }
-        .btn { background: #0284c7; color: #fff; border: none; padding: 12px; border-radius: 10px; font-weight: 600; width: 100%; cursor: pointer; margin-bottom: 8px; font-size: 0.9rem; }
-        .btn-green { background: var(--accent); }
+        body { background: #020617; color: #f8fafc; font-family: -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 16px; }
+        .card { background: #0f172a; border: 1px solid #334155; border-radius: 16px; padding: 24px; max-width: 400px; width: 100%; text-align: center; }
+        h1 { font-size: 1.2rem; color: #38bdf8; margin-bottom: 8px; }
+        p { font-size: 0.85rem; color: #94a3b8; line-height: 1.4; margin-bottom: 16px; }
+        .badge { display: inline-block; padding: 4px 10px; border-radius: 9999px; background: #10b98122; color: #34d399; font-size: 0.75rem; font-weight: 600; }
     </style>
 </head>
 <body>
-    <div class="box">
-        <h1>Claw Controller Active</h1>
-        <p>Control via Web Interface, BLE NUS, or Matrix Keypad</p>
-        <div style="font-size: 2.2rem; font-weight: bold; margin-bottom: 8px;" id="angleVal">90&deg;</div>
-        <input type="range" min="0" max="180" value="90" style="width: 100%; margin-bottom: 16px;" oninput="fetch('/set?angle='+this.value)">
-        <button class="btn btn-green" onclick="fetch('/play?sound=dog_bark')">&#128054; Bark</button>
-        <button class="btn" onclick="fetch('/beep')">&#128276; Test Tone</button>
-        <button class="btn" style="background: #475569;" onclick="fetch('/stop')">&#9209; Stop Audio</button>
+    <div class="card">
+        <h1>ESP32-S3 Claw Firmware Ready</h1>
+        <p>All REST API and BLE NUS services are online. Control the device using your Apple WebLauncher app.</p>
+        <span class="badge">API &amp; BLE Active</span>
     </div>
 </body>
 </html>
@@ -361,7 +356,7 @@ void web_server_init(void) {
 
         httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, http_404_error_handler);
 
-        ESP_LOGI(TAG, "HTTP Server active on port 80");
+        ESP_LOGI(TAG, "HTTP Server active on port 80 (API endpoints ready)");
     } else {
         ESP_LOGE(TAG, "Failed to start HTTP server!");
     }

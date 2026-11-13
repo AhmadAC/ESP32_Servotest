@@ -4,6 +4,7 @@
 #include "servo_controller.h"
 #include "audio_player.h"
 #include "keypad.h"
+#include "joystick.h"
 #include "ble_server.h"
 #include "wifi_manager.h"
 #include "web_server.h"
@@ -38,13 +39,16 @@ extern "C" void app_main(void) {
     // 6. 16-Matrix Keyboard Scanner (with Hold & Release Edge Detection)
     keypad_init(command_on_keypad_event);
 
-    // 7. HTTP Web Server & Dashboard
+    // 7. PS2 Analog Joystick & 4-Button Hardware Subsystem
+    joystick_init();
+
+    // 8. HTTP Web Server & Dashboard
     web_server_init();
 
-    // 8. Bluetooth Low Energy NUS Engine
+    // 9. Bluetooth Low Energy NUS Engine
     ble_server_init(command_on_ble_received);
 
-    // 9. Serial Console (UART0 & Native USB-Serial-JTAG REPL)
+    // 10. Serial Console (UART0 & Native USB-Serial-JTAG REPL)
     console_serial_init();
 
     ESP_LOGI(TAG, "All subsystems running. System ready for commands.");
