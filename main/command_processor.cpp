@@ -1,3 +1,4 @@
+// main/command_processor.cpp
 #include "command_processor.h"
 #include "servo_controller.h"
 #include "audio_player.h"
@@ -21,16 +22,18 @@ static bool s_auto_retract_enabled = true;
 static int s_active_open_key = -1;
 
 void command_processor_init(void) {
+    // Always boot with Auto-Retract enabled by default across power cycles
+    s_auto_retract_enabled = true;
+
     nvs_handle_t handle;
-    if (nvs_open("storage", NVS_READONLY, &handle) == ESP_OK) {
-        uint8_t val = 1;
-        if (nvs_get_u8(handle, "auto_retract", &val) == ESP_OK) {
-            s_auto_retract_enabled = (val != 0);
-        }
+    if (nvs_open("storage", NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_u8(handle, "auto_retract", 1);
+        nvs_commit(handle);
         nvs_close(handle);
     }
-    ESP_LOGI(TAG, "Command Processor Initialized (Matrix Auto-Retract: %s)",
-             s_auto_retract_enabled ? "ON" : "OFF");
+
+    ESP_LOGI(TAG, "Command Processor Initialized (Auto-Retract: %s by default, Claw Limit: %d-%d deg)",
+             s_auto_retract_enabled ? "ON" : "OFF", SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
 }
 
 void command_set_auto_retract(bool enable) {
@@ -47,7 +50,7 @@ void command_set_auto_retract(bool enable) {
     ble_server_send_notify(ble_resp);
 
     command_notify_status();
-    ESP_LOGI(TAG, "Matrix Auto-Retract set to %s (Saved to Flash)", enable ? "ON" : "OFF");
+    ESP_LOGI(TAG, "Auto-Retract set to %s", enable ? "ON" : "OFF");
 }
 
 bool command_get_auto_retract(void) {
@@ -89,12 +92,16 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
         int req_angle = atoi(p);
         if (req_angle >= 0 && req_angle <= 180) {
             servo_set_angle(req_angle);
+            int actual = servo_get_angle();
             char msg[64];
-            snprintf(msg, sizeof(msg), ">> Servo moved to %d deg\n", req_angle);
+            snprintf(msg, sizeof(msg), ">> Servo moved to %d deg\n", actual);
             print_fn(msg);
             command_notify_status();
         } else {
-            print_fn(">> Error: Angle must be between 0 and 180 degrees.\n");
+            char msg[80];
+            snprintf(msg, sizeof(msg), ">> Error: Angle must be between %d and %d degrees.\n",
+                     SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+            print_fn(msg);
         }
         return;
     }
@@ -104,11 +111,11 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
         ((p[0] == '+' || p[0] == '-') && isdigit((unsigned char)p[1]))) {
         int delta = (strncmp(p, "nudge ", 6) == 0) ? atoi(p + 6) : atoi(p);
         int target = servo_get_angle() + delta;
-        if (target < 0) target = 0;
-        if (target > 180) target = 180;
+        if (target < SERVO_MIN_ANGLE) target = SERVO_MIN_ANGLE;
+        if (target > SERVO_MAX_ANGLE) target = SERVO_MAX_ANGLE;
         servo_set_angle(target);
         char msg[64];
-        snprintf(msg, sizeof(msg), ">> Servo nudged by %+d -> %d deg\n", delta, target);
+        snprintf(msg, sizeof(msg), ">> Servo nudged by %+d -> %d deg\n", delta, servo_get_angle());
         print_fn(msg);
         command_notify_status();
         return;
@@ -120,22 +127,22 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
         while (*arg == ' ') arg++;
         if (strcmp(arg, "on") == 0 || strcmp(arg, "1") == 0 || strcmp(arg, "true") == 0) {
             command_set_auto_retract(true);
-            print_fn(">> Matrix Auto-Retract: ON\n");
+            print_fn(">> Auto-Retract: ON\n");
             return;
         } else if (strcmp(arg, "off") == 0 || strcmp(arg, "0") == 0 || strcmp(arg, "false") == 0) {
             command_set_auto_retract(false);
-            print_fn(">> Matrix Auto-Retract: OFF\n");
+            print_fn(">> Auto-Retract: OFF\n");
             return;
         } else if (strcmp(arg, "toggle") == 0) {
             command_set_auto_retract(!s_auto_retract_enabled);
             char msg[64];
-            snprintf(msg, sizeof(msg), ">> Matrix Auto-Retract toggled to: %s\n",
+            snprintf(msg, sizeof(msg), ">> Auto-Retract toggled to: %s\n",
                      s_auto_retract_enabled ? "ON" : "OFF");
             print_fn(msg);
             return;
         } else {
             char msg[64];
-            snprintf(msg, sizeof(msg), ">> Matrix Auto-Retract currently: %s\n",
+            snprintf(msg, sizeof(msg), ">> Auto-Retract currently: %s\n",
                      s_auto_retract_enabled ? "ON" : "OFF");
             print_fn(msg);
             return;
@@ -188,6 +195,7 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
             char line[96];
             snprintf(line, sizeof(line), "KEY:%d=%s\n", i, kcmd);
             ble_server_send_notify(line);
+            print_fn(line);
             vTaskDelay(pdMS_TO_TICKS(15));
         }
         print_fn(">> Keypad reset to defaults.\n");
@@ -199,11 +207,14 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
         if (req_angle >= 0 && req_angle <= 180) {
             servo_set_angle(req_angle);
             char msg[64];
-            snprintf(msg, sizeof(msg), ">> Servo moved to %d deg\n", req_angle);
+            snprintf(msg, sizeof(msg), ">> Servo moved to %d deg\n", servo_get_angle());
             print_fn(msg);
             command_notify_status();
         } else {
-            print_fn(">> Error: Angle must be between 0 and 180 degrees.\n");
+            char msg[80];
+            snprintf(msg, sizeof(msg), ">> Error: Angle must be between %d and %d degrees.\n",
+                     SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+            print_fn(msg);
         }
     } else if (strcmp(p, "bark") == 0 || strcmp(p, "play") == 0 || strcmp(p, "sound") == 0) {
         audio_play("dog_bark");
@@ -257,10 +268,10 @@ void command_process(const char *cmd_line, command_print_fn_t print_fn) {
         command_notify_status();
     } else if (strcmp(p, "help") == 0 || strcmp(p, "?") == 0) {
         print_fn("Available Commands:\n"
-                 "  0 - 180          : Move servo angle directly\n"
-                 "  angle <0-180>    : Move servo angle\n"
+                 "  0 - 135          : Move servo angle directly (0-135 hard limit)\n"
+                 "  angle <0-135>    : Move servo angle\n"
                  "  nudge <+/-deg>   : Nudge angle (e.g. 'nudge +10', '-5')\n"
-                 "  autoretract <on/off/toggle> : Hold-to-open matrix retract mode\n"
+                 "  autoretract <on/off/toggle> : Hold-to-open retract mode\n"
                  "  key <1-16> <cmd> : Reprogram key and save to NVS flash\n"
                  "  getkeys          : Read all 16 key actions over BLE\n"
                  "  keyreset         : Restore factory defaults on keypad\n"
@@ -312,9 +323,9 @@ void command_on_keypad_event(int key_index, const char *cmd, bool is_pressed) {
             target_angle = servo_get_angle() + atoi(p[0] == '+' ? p : p + 6);
         }
 
-        if (target_angle > 0) {
+        if (target_angle > SERVO_MIN_ANGLE) {
             s_active_open_key = key_index;
-        } else if (target_angle == 0) {
+        } else if (target_angle == SERVO_MIN_ANGLE) {
             s_active_open_key = -1;
         }
 
@@ -329,9 +340,9 @@ void command_on_keypad_event(int key_index, const char *cmd, bool is_pressed) {
 
         if (s_auto_retract_enabled) {
             // If the key that opened/nudged the claw was let go, immediately snap back to 0°
-            if (s_active_open_key == key_index || (s_active_open_key == -1 && servo_get_angle() > 0)) {
+            if (s_active_open_key == key_index || (s_active_open_key == -1 && servo_get_angle() > SERVO_MIN_ANGLE)) {
                 s_active_open_key = -1;
-                servo_set_angle(0);
+                servo_set_angle(SERVO_MIN_ANGLE);
                 command_notify_status();
                 console_print(">> Auto-Retract triggered on release: Claw snapped to 0 deg\n");
                 ble_server_send_notify("AUTORETRACT:RETRACTED\n");

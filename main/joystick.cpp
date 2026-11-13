@@ -1,3 +1,4 @@
+// main/joystick.cpp
 #include "joystick.h"
 #include "servo_controller.h"
 #include "command_processor.h"
@@ -11,6 +12,7 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
 #include <math.h>
+#include <stdio.h>
 
 static const char *TAG = "JOYSTICK";
 
@@ -19,8 +21,13 @@ static adc_oneshot_unit_handle_t adc1_handle = NULL;
 #define ADC_VRX_CHANNEL     ADC_CHANNEL_0  // GPIO 1
 #define ADC_VRY_CHANNEL     ADC_CHANNEL_1  // GPIO 2
 
-#define DEADZONE_MARGIN     350
-#define ADC_MAX_VAL         4095
+#define ADC_EFF_MIN         100.0f         // Reliable low-end pot rail
+#define ADC_EFF_MAX         3995.0f        // Reliable high-end pot rail (below 4095 saturation)
+#define ADC_MIN_SPAN        200.0f         // Minimum span guard against division by zero
+#define DEADZONE_NORM       0.14f          // ~14% radial center deadzone
+#define EMA_ALPHA           0.45f          // Smoothing factor for jitter-free 1-deg precision
+#define RESPONSE_GAMMA      1.35f          // Gentle curve for fine 1-deg control near small angles
+#define ADC_AVG_SAMPLES     8              // Multi-sample read per poll tick
 
 static const gpio_num_t BUTTON_PINS[] = {
     JOYSTICK_SW_PIN,
@@ -32,29 +39,62 @@ static const gpio_num_t BUTTON_PINS[] = {
 
 #define NUM_BUTTONS (sizeof(BUTTON_PINS) / sizeof(BUTTON_PINS[0]))
 
-static void joystick_poll_task(void *pvParameters) {
-    // 1. Initial ADC Calibration / Baseline determination
-    int center_x = 2048;
-    int center_y = 2048;
+static float read_adc_avg(adc_channel_t channel, int samples) {
+    long sum = 0;
+    int valid = 0;
+    for (int i = 0; i < samples; i++) {
+        int val = 0;
+        if (adc_oneshot_read(adc1_handle, channel, &val) == ESP_OK) {
+            sum += val;
+            valid++;
+        }
+    }
+    if (valid == 0) return 2048.0f;
+    return (float)sum / (float)valid;
+}
 
-    long accum_x = 0;
-    long accum_y = 0;
-    const int CAL_SAMPLES = 20;
+static float normalize_axis(float val, float center) {
+    float delta = val - center;
+    if (delta >= 0.0f) {
+        float span = ADC_EFF_MAX - center;
+        if (span < ADC_MIN_SPAN) span = ADC_MIN_SPAN;
+        float n = delta / span;
+        return (n > 1.0f) ? 1.0f : n;
+    } else {
+        float span = center - ADC_EFF_MIN;
+        if (span < ADC_MIN_SPAN) span = ADC_MIN_SPAN;
+        float n = delta / span;
+        return (n < -1.0f) ? -1.0f : n;
+    }
+}
+
+static void joystick_poll_task(void *pvParameters) {
+    (void)pvParameters;
+
+    // 1. Initial ADC Calibration / Center Baseline determination
+    float accum_x = 0.0f;
+    float accum_y = 0.0f;
+    const int CAL_SAMPLES = 32;
 
     for (int i = 0; i < CAL_SAMPLES; i++) {
-        int rx = 2048, ry = 2048;
-        adc_oneshot_read(adc1_handle, ADC_VRX_CHANNEL, &rx);
-        adc_oneshot_read(adc1_handle, ADC_VRY_CHANNEL, &ry);
-        accum_x += rx;
-        accum_y += ry;
-        vTaskDelay(pdMS_TO_TICKS(10));
+        accum_x += read_adc_avg(ADC_VRX_CHANNEL, 4);
+        accum_y += read_adc_avg(ADC_VRY_CHANNEL, 4);
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
-    center_x = accum_x / CAL_SAMPLES;
-    center_y = accum_y / CAL_SAMPLES;
-    ESP_LOGI(TAG, "PS2 Joystick Calibrated Center -> X: %d, Y: %d", center_x, center_y);
+
+    float center_x = accum_x / (float)CAL_SAMPLES;
+    float center_y = accum_y / (float)CAL_SAMPLES;
+    float filt_x = center_x;
+    float filt_y = center_y;
+
+    ESP_LOGI(TAG, "PS2 Joystick Calibrated Center -> X: %.1f, Y: %.1f (360-deg radial -> %d-%d deg)",
+             center_x, center_y, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
 
     bool was_deflected = false;
+    bool prev_auto_retract = command_get_auto_retract();
     int last_applied_angle = servo_get_angle();
+    bool pending_notify = false;
+    TickType_t last_notify_tick = 0;
 
     // Button debounce tracking
     uint8_t press_count[NUM_BUTTONS] = {0};
@@ -63,62 +103,86 @@ static void joystick_poll_task(void *pvParameters) {
     const uint8_t DEBOUNCE_THRESHOLD = 3;
 
     while (1) {
-        // --- 1. Read Analog Joystick Axes ---
-        int raw_x = 0;
-        int raw_y = 0;
-        adc_oneshot_read(adc1_handle, ADC_VRX_CHANNEL, &raw_x);
-        adc_oneshot_read(adc1_handle, ADC_VRY_CHANNEL, &raw_y);
+        // --- 1. Read & Filter Analog Joystick Axes (360-Degree Radial Control) ---
+        float raw_x = read_adc_avg(ADC_VRX_CHANNEL, ADC_AVG_SAMPLES);
+        float raw_y = read_adc_avg(ADC_VRY_CHANNEL, ADC_AVG_SAMPLES);
 
-        int delta_x = raw_x - center_x;
-        int delta_y = raw_y - center_y;
+        filt_x += EMA_ALPHA * (raw_x - filt_x);
+        filt_y += EMA_ALPHA * (raw_y - filt_y);
 
-        bool active_x = abs(delta_x) > DEADZONE_MARGIN;
-        bool active_y = abs(delta_y) > DEADZONE_MARGIN;
+        float nx = normalize_axis(filt_x, center_x);
+        float ny = normalize_axis(filt_y, center_y);
 
-        if (active_x || active_y) {
-            was_deflected = true;
+        // Radial magnitude in all 360 degrees around center
+        float mag = sqrtf((nx * nx) + (ny * ny));
+        if (mag > 1.0f) mag = 1.0f;
 
-            // Map deflection directly across 0 to 180 degrees
-            int target_angle = 90;
-            if (active_x) {
-                if (delta_x > 0) {
-                    float norm = (float)(delta_x - DEADZONE_MARGIN) / (float)(ADC_MAX_VAL - center_x - DEADZONE_MARGIN);
-                    if (norm > 1.0f) norm = 1.0f;
-                    target_angle = 90 + (int)(norm * 90.0f);
-                } else {
-                    float norm = (float)(-delta_x - DEADZONE_MARGIN) / (float)(center_x - DEADZONE_MARGIN);
-                    if (norm > 1.0f) norm = 1.0f;
-                    target_angle = 90 - (int)(norm * 90.0f);
-                }
-            } else if (active_y) {
-                // Secondary axis: nudges or sets upper/lower range
-                if (delta_y > 0) {
-                    float norm = (float)(delta_y - DEADZONE_MARGIN) / (float)(ADC_MAX_VAL - center_y - DEADZONE_MARGIN);
-                    target_angle = (int)(norm * 180.0f);
-                } else {
-                    target_angle = 0;
-                }
+        bool cur_auto_retract = command_get_auto_retract();
+        bool in_deflection = (mag > DEADZONE_NORM);
+
+        // If Auto-Retract was just switched ON while joystick rests at center, retract immediately
+        if (!prev_auto_retract && cur_auto_retract) {
+            if (!in_deflection && servo_get_angle() > SERVO_MIN_ANGLE) {
+                servo_set_angle(SERVO_MIN_ANGLE);
+                last_applied_angle = SERVO_MIN_ANGLE;
+                pending_notify = false;
+                command_notify_status();
+                last_notify_tick = xTaskGetTickCount();
+                console_print(">> Auto-Retract Enabled -> Claw Retracted to 0 deg\n");
+                ble_server_send_notify("AUTORETRACT:RETRACTED\n");
+            }
+        }
+        prev_auto_retract = cur_auto_retract;
+
+        if (in_deflection) {
+            if (!was_deflected) {
+                was_deflected = true;
+                last_applied_angle = servo_get_angle();
             }
 
-            if (target_angle < 0) target_angle = 0;
-            if (target_angle > 180) target_angle = 180;
+            float effective = (mag - DEADZONE_NORM) / (1.0f - DEADZONE_NORM);
+            if (effective < 0.0f) effective = 0.0f;
+            if (effective > 1.0f) effective = 1.0f;
 
-            if (abs(target_angle - last_applied_angle) >= 2) {
+            // Gentle curve provides fine 1-degree thumb control at small/mid openings
+            float curved = powf(effective, RESPONSE_GAMMA);
+            int target_angle = (int)lroundf(curved * (float)(SERVO_MAX_ANGLE - SERVO_MIN_ANGLE)) + SERVO_MIN_ANGLE;
+
+            if (target_angle < SERVO_MIN_ANGLE) target_angle = SERVO_MIN_ANGLE;
+            if (target_angle > SERVO_MAX_ANGLE) target_angle = SERVO_MAX_ANGLE;
+
+            if (target_angle != last_applied_angle) {
                 last_applied_angle = target_angle;
                 servo_set_angle(target_angle);
+                pending_notify = true;
+            }
+
+            if (pending_notify && (xTaskGetTickCount() - last_notify_tick) >= pdMS_TO_TICKS(60)) {
                 command_notify_status();
+                last_notify_tick = xTaskGetTickCount();
+                pending_notify = false;
             }
         } else {
-            // Joystick is resting at Center Deadzone
+            // Joystick is resting inside Center Deadzone
             if (was_deflected) {
                 was_deflected = false;
-                if (command_get_auto_retract()) {
-                    servo_set_angle(0);
-                    last_applied_angle = 0;
+                if (cur_auto_retract) {
+                    servo_set_angle(SERVO_MIN_ANGLE);
+                    last_applied_angle = SERVO_MIN_ANGLE;
+                    pending_notify = false;
                     command_notify_status();
+                    last_notify_tick = xTaskGetTickCount();
                     console_print(">> PS2 Joystick Centered -> Auto-Retracted to 0 deg\n");
                     ble_server_send_notify("AUTORETRACT:RETRACTED\n");
+                } else if (pending_notify) {
+                    command_notify_status();
+                    last_notify_tick = xTaskGetTickCount();
+                    pending_notify = false;
                 }
+            } else if (pending_notify) {
+                command_notify_status();
+                last_notify_tick = xTaskGetTickCount();
+                pending_notify = false;
             }
         }
 
@@ -143,9 +207,9 @@ static void joystick_poll_task(void *pvParameters) {
                                      !current_mode ? "ON" : "OFF");
                             console_print(log_msg);
                         } else if (BUTTON_PINS[b] == JOYSTICK_BTN1_PIN) {
-                            // K1 (Red): Open Claw completely (180 deg)
-                            console_print(">> [Joystick Button 1 / RED] -> Open Claw (180 deg)\n");
-                            command_on_keypad_event(4, "180", true);
+                            // K1 (Red): Open Claw to hard limit (135 deg)
+                            console_print(">> [Joystick Button 1 / RED] -> Open Claw (135 deg limit)\n");
+                            command_on_keypad_event(4, "135", true);
                         } else if (BUTTON_PINS[b] == JOYSTICK_BTN2_PIN) {
                             // K2 (Green): Set Claw to Center (90 deg)
                             console_print(">> [Joystick Button 2 / GREEN] -> Center Claw (90 deg)\n");
@@ -172,7 +236,7 @@ static void joystick_poll_task(void *pvParameters) {
 
                             // Edge detection release: trigger auto-retract if hold-to-open button was released
                             if (BUTTON_PINS[b] == JOYSTICK_BTN1_PIN) {
-                                command_on_keypad_event(4, "180", false);
+                                command_on_keypad_event(4, "135", false);
                             } else if (BUTTON_PINS[b] == JOYSTICK_BTN2_PIN) {
                                 command_on_keypad_event(3, "90", false);
                             }
@@ -192,6 +256,7 @@ void joystick_init(void) {
     // 1. Configure ADC1 for VRX (GPIO 1) and VRY (GPIO 2)
     adc_oneshot_unit_init_cfg_t init_config1 = {
         .unit_id = ADC_UNIT_1,
+        .clk_src = ADC_RTC_CLK_SRC_DEFAULT,
         .ulp_mode = ADC_ULP_MODE_DISABLE,
     };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));

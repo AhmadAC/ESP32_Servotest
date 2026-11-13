@@ -1,3 +1,4 @@
+// main/servo_controller.cpp
 #include "servo_controller.h"
 #include "driver/ledc.h"
 #include "esp_log.h"
@@ -10,11 +11,11 @@ static const char *TAG = "SERVO";
 #define LEDC_DUTY_RES       LEDC_TIMER_14_BIT
 #define LEDC_FREQUENCY      50
 
-static int current_servo_angle = 90;
+static int current_servo_angle = SERVO_MIN_ANGLE;
 
 static uint32_t angle_to_duty(int angle) {
-    if (angle < 0) angle = 0;
-    if (angle > 180) angle = 180;
+    if (angle < SERVO_MIN_ANGLE) angle = SERVO_MIN_ANGLE;
+    if (angle > SERVO_MAX_ANGLE) angle = SERVO_MAX_ANGLE;
 
     uint32_t pulse_us = SERVO_MIN_US + ((SERVO_MAX_US - SERVO_MIN_US) * angle) / 180;
     uint32_t duty = (pulse_us * ((1 << 14) - 1)) / 20000;
@@ -40,12 +41,13 @@ void servo_controller_init(void) {
     ledc_channel.hpoint         = 0;
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 
-    ESP_LOGI(TAG, "Servo hardware PWM ready on GPIO %d (Angle: %d deg)", SERVO_PIN, current_servo_angle);
+    ESP_LOGI(TAG, "Servo hardware PWM ready on GPIO %d (Angle: %d deg, Limit: %d-%d deg)",
+             SERVO_PIN, current_servo_angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
 }
 
 void servo_set_angle(int angle) {
-    if (angle < 0) angle = 0;
-    if (angle > 180) angle = 180;
+    if (angle < SERVO_MIN_ANGLE) angle = SERVO_MIN_ANGLE;
+    if (angle > SERVO_MAX_ANGLE) angle = SERVO_MAX_ANGLE;
 
     current_servo_angle = angle;
     uint32_t duty = angle_to_duty(angle);
